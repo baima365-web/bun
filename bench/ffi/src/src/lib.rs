@@ -33,6 +33,15 @@ fn hash(buf: &[u8]) -> u32 {
   return &STRING[0..(STRING.len() - 1)];
 }
 
+
+// Takes a NUL-terminated C string: measures the JS-string -> const char* INPUT path.
+#[no_mangle] unsafe extern "C" fn ffi_strlen(p: *const u8) -> u32 {
+    if p.is_null() { return 0; }
+    let mut n = 0u32;
+    while *p.add(n as usize) != 0 { n += 1; }
+    n
+}
+
 #[no_mangle] unsafe extern "C" fn ffi_string() -> *const u8 {
   return STRING.as_ptr();
 }

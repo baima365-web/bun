@@ -114,6 +114,14 @@ unsafe extern "C" {
     fn bun_ffi_ensure_offsets_are_loaded();
 }
 
+// ─── Engine-native FFI availability ──
+unsafe extern "C" {
+    /// `JSC::FFI::isAvailable()` — the JIT is enabled AND the executable allocator initialized
+    /// AND this is a supported build. When false the engine's create() functions throw, so we
+    /// route to the TinyCC path instead of surfacing "bun:ffi requires the JIT" to the user.
+    fn Bun__JSCFFIIsAvailable() -> bool;
+}
+
 // ─── Local extern thin-wrappers (codegen / `bun_jsc` surface not yet wired) ──
 unsafe extern "C" {
     /// `host_fn::NewRuntimeFunction` — `Bun__CreateFFIFunctionValue`.
@@ -156,14 +164,25 @@ unsafe extern "C" {
 /// per-symbol eligibility checks (napi_env/napi_value, threadsafe) are the callers' concern.
 #[inline]
 fn jsc_ffi_enabled() -> bool {
-    !bun_core::env_var::feature_flag::BUN_FEATURE_FLAG_DISABLE_JSC_FFI
+    if bun_core::env_var::feature_flag::BUN_FEATURE_FLAG_DISABLE_JSC_FFI
         .get()
         .unwrap_or(false)
+    {
+        return false;
+    }
+    // Fall back to TinyCC whenever the engine could not run the FFI machinery (JIT disabled via
+    // BUN_JSC_useJIT=0, executable allocator failed, or an unsupported build) -- the engine would
+    // otherwise throw "bun:ffi requires the JIT" and dlopen would fail with no fallback. Availability
+    // is fixed for the process's lifetime, so query the engine once and cache it.
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: a plain by-value query into JSC with no arguments and no side effects.
+    *AVAILABLE.get_or_init(|| unsafe { Bun__JSCFFIIsAvailable() })
 }
 
 /// Creates the JSC-native FFI function for `function` bound to `target` and returns it, or
-/// `None` if this symbol must take the TinyCC path (see `Function::can_use_jsc_ffi`). An
-/// engine-side failure surfaces as a returned exception value the caller propagates.
+/// Callers check `Function::can_use_jsc_ffi()` before calling this. On engine-side failure
+/// (invalid signature / executable-memory OOM) this returns an EMPTY `JSValue` with an
+/// exception pending on `global`; callers test `.is_empty()` and surface the error.
 fn create_jsc_ffi_function(
     global: &JSGlobalObject,
     symbol_name: &ZigString,
@@ -1390,7 +1409,9 @@ impl FFI {
             };
             if cb.is_empty() {
                 return Ok(if global_this.has_exception() {
-                    global_this.take_exception(JsError::Thrown)
+                    // take_error (not take_exception): unwrap the JSC::Exception wrapper cell to
+                    // the ErrorInstance so the glue's Error.isError() sees a real error.
+                    global_this.take_error(JsError::Thrown)
                 } else {
                     ZigString::init(b"Failed to create FFI callback").to_error_instance(global_this)
                 });
@@ -1692,9 +1713,11 @@ impl FFI {
                 let cb = create_jsc_ffi_function(global, &str, function, target);
                 if cb.is_empty() {
                     // The engine threw (invalid signature / executable-memory OOM); return the
-                    // pending exception value, matching how the TinyCC failure paths return errors.
+                    // ErrorInstance (take_error unwraps the JSC::Exception wrapper cell, which the
+                    // glue's Error.isError() would otherwise not recognize), matching how the
+                    // TinyCC failure paths return real errors via to_invalid_arguments().
                     let ret = if global.has_exception() {
-                        global.take_exception(JsError::Thrown)
+                        global.take_error(JsError::Thrown)
                     } else {
                         global.to_invalid_arguments(format_args!(
                             "Failed to create FFI function for symbol \"{}\" in \"{}\"",
@@ -1826,7 +1849,7 @@ impl FFI {
                 let cb = create_jsc_ffi_function(global, &name, function, target);
                 if cb.is_empty() {
                     return if global.has_exception() {
-                        global.take_exception(JsError::Thrown)
+                        global.take_error(JsError::Thrown) // ErrorInstance, so Error.isError() holds
                     } else {
                         global.to_invalid_arguments(format_args!(
                             "Failed to create FFI function for symbol \"{}\"",

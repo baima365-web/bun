@@ -365,8 +365,9 @@ function wrapSymbol(symbol, params, returnType, name, shouldWrap: boolean) {
       wrapped.native = symbol;
       return wrapped;
     }
-    // The engine-native symbol IS its own .native / carries .ptr as engine intrinsics; writing
-    // an own property here would transition the cell's Structure and slow polymorphic call sites.
+    // The engine serves .native (=== the function itself) and .ptr as intrinsic properties of
+    // the JSFFIFunction cell (JSFFIFunction::getOwnPropertySlot), so nothing is written here:
+    // an own-property write would transition the cell's Structure and slow polymorphic call sites.
     return symbol;
   }
 

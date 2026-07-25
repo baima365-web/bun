@@ -34,6 +34,16 @@ static_assert(static_cast<uint8_t>(JSC::FFI::Type::Buffer) == 20, "FFI::Type tag
 // Creates a JSC-native FFI function for `target` with the given Bun ABIType tags. Returns the
 // encoded JSFFIFunction, or an empty value with an exception pending on failure (invalid
 // signature, executable-memory exhaustion). `argTypes` may be null when `argCount` is 0.
+// True iff the engine-native FFI is usable in this process (JIT enabled, executable allocator
+// initialized, supported build). Exactly the condition JSFFIFunction::create /
+// JSFFICallback::create enforce, so the caller can fall back to TinyCC instead of hitting the
+// "bun:ffi requires the JIT" TypeError (e.g. BUN_JSC_useJIT=0, or a locked-down environment
+// without executable memory).
+extern "C" bool Bun__JSCFFIIsAvailable()
+{
+    return JSC::FFI::isAvailable();
+}
+
 extern "C" JSC::EncodedJSValue Bun__CreateJSCFFIFunction(
     Zig::GlobalObject* globalObject,
     const ZigString* symbolName,

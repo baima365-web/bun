@@ -2185,3 +2185,31 @@ export function getPuppeteerInstallEnv(): Record<string, string> {
   // env to whatever later launches puppeteer so it finds the browser.
   return { PUPPETEER_CACHE_DIR: tmpdirSync("puppeteer-cache") };
 }
+
+// Compiles a C source file into a shared library with the host `cc` (present in $PATH on every
+// CI test host) and returns the library path. Cached per source path within the process.
+const compiledFixtures = new Map<string, string>();
+export function compileFixture(sourcePath: string, options: { flags?: string[] } = {}): string {
+  const cached = compiledFixtures.get(sourcePath);
+  if (cached) return cached;
+
+  const outDir = tempDir("ffi-fixture", {});
+  const base = basename(sourcePath).replace(/\.c$/, "");
+  const libExt = isWindows ? "dll" : isMacOS ? "dylib" : "so";
+  const outPath = join(outDir, `${base}.${libExt}`);
+
+  const cc = which("cc") || which("clang") || which("gcc");
+  if (!cc) throw new Error("compileFixture: no C compiler (cc/clang/gcc) found in $PATH");
+
+  const cmd = isWindows
+    ? [cc, sourcePath, "-shared", "-o", outPath, ...(options.flags ?? [])]
+    : [cc, sourcePath, "-shared", "-fPIC", "-O2", "-o", outPath, ...(options.flags ?? [])];
+  const { exitCode, stderr } = spawnSync({ cmd, cwd: outDir, stdout: "inherit", stderr: "pipe", env: bunEnv });
+  if (exitCode !== 0) {
+    throw new Error(
+      `compileFixture: \`${cmd.join(" ")}\` failed (exit ${exitCode}):\n${stderr?.toString?.() ?? stderr}`,
+    );
+  }
+  compiledFixtures.set(sourcePath, outPath);
+  return outPath;
+}
