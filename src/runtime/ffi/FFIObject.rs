@@ -90,6 +90,66 @@ pub(crate) fn new_cstring(
     }
 }
 
+// ─── CString: C-ABI shims for the native `CString` class (JSFFICString) ─────
+// bun:ffi's `CString` is now a native class in the C++ bindings (src/jsc/bindings/JSFFICString.cpp)
+// so that constructing one does no per-instance property adds. Its constructor / accessors reach
+// the pointer -> string transcoding and the ArrayBuffer view through these three exports, keeping
+// `get_ptr_slice` / `new_cstring` / `to_array_buffer` as the single implementation (every
+// validation rule and error message unchanged).
+
+/// `Bun.FFI.CString(ptr, byteOffset?, byteLength?)` called WITHOUT `new` — the legacy transcoder
+/// (a JS string, or an Error VALUE for a bad pointer). Forwards the whole call frame, so arity
+/// handling is identical to the old `Bun.FFI.CString` host function.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn Bun__FFI__CString__call(
+    global: &JSGlobalObject,
+    callframe: &CallFrame,
+) -> JSValue {
+    jsc::to_js_host_fn_result(global, fields::cstring(global, callframe))
+}
+
+/// Transcode the C string at `ptr` (`byteOffset` / `byteLength` may be `undefined`) for the
+/// native `new CString(...)` constructor. Invalid input yields an Error VALUE, not an exception.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn Bun__FFI__CString__transcode(
+    global: &JSGlobalObject,
+    ptr: JSValue,
+    byte_offset: JSValue,
+    byte_length: JSValue,
+) -> JSValue {
+    jsc::to_js_host_fn_result(
+        global,
+        new_cstring(global, ptr, Some(byte_offset), Some(byte_length)),
+    )
+}
+
+/// `cstring.arrayBuffer` — exactly `toArrayBuffer(ptr, byteOffset, byteLength)` (no finalizer),
+/// which is what the old JS getter called.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn Bun__FFI__CString__toArrayBuffer(
+    global: &JSGlobalObject,
+    ptr: JSValue,
+    byte_offset: JSValue,
+    byte_length: JSValue,
+) -> JSValue {
+    jsc::to_js_host_fn_result(
+        global,
+        to_array_buffer(
+            global,
+            ptr,
+            Some(byte_offset),
+            Some(byte_length),
+            None,
+            None,
+        ),
+    )
+}
+
+// The native `CString` constructor (JSFFICStringConstructor), owned by the C++ global object.
+unsafe extern "C" {
+    fn Bun__FFI__CStringConstructor(global: *const JSGlobalObject) -> JSValue;
+}
+
 // DOMJIT fast-path descriptor + slow-path host fn, represented here as a const
 // descriptor. The `DOMEffect.forRead(.TypedArrayProperties)` argument is consumed
 // by the C++ codegen, not the runtime descriptor; it lives in the generated
@@ -103,34 +163,22 @@ pub(crate) const DOM_CALL: DomCall = DomCall {
 pub fn to_js(global_object: &JSGlobalObject) -> JSValue {
     // Unrolled manually; keep in sync with `FIELDS` below.
     let fields = FIELDS();
-    let object = JSValue::create_empty_object(global_object, fields.len() + 2);
+    let object = JSValue::create_empty_object(global_object, fields.len() + 3);
 
     for &(name, func) in &fields {
-        if name == "CString" {
-            // CString needs to be callable as a constructor for backward compatibility.
-            // Pass the same function as the constructor so `new CString(ptr)` works.
-            object.put(
-                global_object,
-                name.as_bytes(),
-                JSFunction::create(
-                    global_object,
-                    name,
-                    func,
-                    1,
-                    jsc::js_function::CreateJSFunctionOptions {
-                        constructor: Some(func),
-                        ..Default::default()
-                    },
-                ),
-            );
-        } else {
-            object.put(
-                global_object,
-                name.as_bytes(),
-                JSFunction::create(global_object, name, func, 1, Default::default()),
-            );
-        }
+        object.put(
+            global_object,
+            name.as_bytes(),
+            JSFunction::create(global_object, name, func, 1, Default::default()),
+        );
     }
+
+    // `CString` is the native JSFFICString constructor (constructable AND callable-without-new for
+    // backward compatibility); bun:ffi re-exports this very object as `CString`.
+    // SAFETY: `global_object` is a live JSC handle for the duration of the call.
+    object.put(global_object, b"CString", unsafe {
+        Bun__FFI__CStringConstructor(global_object)
+    });
 
     // SAFETY: `put` is the C++-side `FFI__ptr__put` helper; global_object is live.
     unsafe { (DOM_CALL.put)(std::ptr::from_ref(global_object).cast_mut(), object) };
@@ -880,13 +928,25 @@ mod fields {
         Ok(FfiImpl::close_jsc_callback(global, callback))
     }
 
-    // CString → new_cstring(global, JSValue, ?JSValue, ?JSValue) -> JsResult<JSValue>
+    // CString called as a plain function (`Bun.FFI.CString(ptr, byteOffset?, byteLength?)`
+    // without `new`) → new_cstring(global, JSValue, ?JSValue, ?JSValue) -> JsResult<JSValue>.
+    // Reached from the native constructor's [[Call]] via `Bun__FFI__CString__call`.
     pub(super) fn cstring(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
         let mut iter = callframe.arguments().iter();
         let value = eat_required(global, &mut iter)?;
         let byte_offset = next_eat(&mut iter);
         let length = next_eat(&mut iter);
         new_cstring(global, value, byte_offset, length)
+    }
+
+    // cfunction → FFI::create_cfunction(global, JSValue, ?JSValue) -> JsResult<JSValue>
+    // `CFunction()`'s fast path: one engine-native FFI function straight from a
+    // `{ ptr, args, returns }` descriptor, without a `linkSymbols()` object.
+    pub(super) fn cfunction(global: &JSGlobalObject, callframe: &CallFrame) -> JsResult<JSValue> {
+        let mut iter = callframe.arguments().iter();
+        let options = eat_required(global, &mut iter)?;
+        let name = next_eat(&mut iter);
+        FfiImpl::create_cfunction(global, options, name)
     }
 }
 
@@ -908,7 +968,7 @@ fn FIELDS() -> [(&'static str, jsc::JSHostFn); 9] {
             "closeJSCCallback",
             wrap_host_fn!(fields::close_jsc_callback),
         ),
-        ("CString", wrap_host_fn!(fields::cstring)),
+        ("cfunction", wrap_host_fn!(fields::cfunction)),
     ]
 }
 

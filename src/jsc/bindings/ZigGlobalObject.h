@@ -261,6 +261,10 @@ public:
     JSC::JSObject* JSStringDecoder() const { return m_JSStringDecoderClassStructure.constructorInitializedOnMainThread(this); }
     JSC::JSValue JSStringDecoderPrototype() const { return m_JSStringDecoderClassStructure.prototypeInitializedOnMainThread(this); }
 
+    JSC::Structure* JSFFICStringStructure() const { return m_JSFFICStringClassStructure.getInitializedOnMainThread(this); }
+    JSC::JSObject* JSFFICStringConstructor() const { return m_JSFFICStringClassStructure.constructorInitializedOnMainThread(this); }
+    JSC::JSValue JSFFICStringPrototype() const { return m_JSFFICStringClassStructure.prototypeInitializedOnMainThread(this); }
+
     JSC::Structure* NodeVMScriptStructure() const { return m_NodeVMScriptClassStructure.getInitializedOnMainThread(this); }
     JSC::JSObject* NodeVMScript() const { return m_NodeVMScriptClassStructure.constructorInitializedOnMainThread(this); }
     JSC::JSValue NodeVMScriptPrototype() const { return m_NodeVMScriptClassStructure.prototypeInitializedOnMainThread(this); }
@@ -559,6 +563,7 @@ public:
     V(private, LazyClassStructure, m_JSH3ResponseSinkClassStructure)                                         \
                                                                                                              \
     V(private, LazyClassStructure, m_JSStringDecoderClassStructure)                                          \
+    V(private, LazyClassStructure, m_JSFFICStringClassStructure)                                             \
     V(public, LazyClassStructure, m_JSDatabaseSyncClassStructure)                                            \
     V(public, LazyClassStructure, m_JSStatementSyncClassStructure)                                           \
     V(public, LazyClassStructure, m_JSStatementSyncIteratorClassStructure)                                   \

@@ -34,6 +34,7 @@ public:
     std::unique_ptr<IsoSubspace> m_subspaceForJSSinkController;
     std::unique_ptr<IsoSubspace> m_subspaceForJSSink;
     std::unique_ptr<IsoSubspace> m_subspaceForStringDecoder;
+    std::unique_ptr<IsoSubspace> m_subspaceForFFICString;
     std::unique_ptr<IsoSubspace> m_subspaceForReadableState;
     std::unique_ptr<IsoSubspace> m_subspaceForPendingVirtualModuleResult;
     std::unique_ptr<IsoSubspace> m_subspaceForCallSite;

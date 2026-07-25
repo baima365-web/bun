@@ -71,15 +71,16 @@ const toBuffer = ffi.toBuffer;
 const toArrayBuffer = ffi.toArrayBuffer;
 const nativeViewSource = ffi.viewSource;
 
-const BunCString = ffi.CString;
 const nativeLinkSymbols = ffi.linkSymbols;
 const nativeDLOpen = ffi.dlopen;
 const nativeCallback = ffi.callback;
 const closeCallback = ffi.closeCallback;
 const closeJSCCallback = ffi.closeJSCCallback;
+const nativeCFunction = ffi.cfunction;
 delete ffi.callback;
 delete ffi.closeCallback;
 delete ffi.closeJSCCallback;
+delete ffi.cfunction;
 
 class JSCallback {
   constructor(cb, options) {
@@ -128,41 +129,14 @@ class JSCallback {
   }
 }
 
-class CString extends String {
-  constructor(ptr, byteOffset?, byteLength?) {
-    super(
-      ptr
-        ? typeof byteLength === "number" && Number.isSafeInteger(byteLength)
-          ? BunCString(ptr, byteOffset || 0, byteLength)
-          : BunCString(ptr, byteOffset || 0)
-        : "",
-    );
-    this.ptr = typeof ptr === "number" ? ptr : 0;
-    if (typeof byteOffset !== "undefined") {
-      this.byteOffset = byteOffset;
-    }
-    if (typeof byteLength !== "undefined") {
-      this.byteLength = byteLength;
-    }
-  }
-
-  ptr;
-  byteOffset;
-  byteLength;
-  #cachedArrayBuffer;
-
-  get arrayBuffer() {
-    if (this.#cachedArrayBuffer) {
-      return this.#cachedArrayBuffer;
-    }
-
-    if (!this.ptr) {
-      return (this.#cachedArrayBuffer = new ArrayBuffer(0));
-    }
-
-    return (this.#cachedArrayBuffer = toArrayBuffer(this.ptr, this.byteOffset, this.byteLength));
-  }
-}
+// `CString` is a native class (JSFFICString in Bun's C++ bindings): a String object (so
+// `String(cs)`, `cs.length`, `` `${cs}` ``, `cs == "text"`, `cs instanceof String` all behave as
+// with the old `class CString extends String`) whose `ptr` / `byteOffset` / `byteLength` /
+// `arrayBuffer` live in the cell and are read through prototype accessors. Constructing one adds no
+// per-instance properties -- no Structure transition -- which is what the `returns: "cstring"`
+// hot path pays for. `Bun.FFI.CString` is that constructor: `new CString(ptr)` builds the
+// object, while calling it without `new` stays the legacy pointer -> string transcoder.
+const CString = ffi.CString;
 Object.defineProperty(globalThis, "__GlobalBunCString", {
   value: CString,
   enumerable: false,
@@ -599,8 +573,27 @@ var cFunctionRegistry;
 function onCloseCFunction(close) {
   close();
 }
+// The engine-native FFI function returned on the fast path owns nothing that has to be freed (no
+// TinyCC state, no library handle -- the cell and its JIT'd stub are garbage collected), so its
+// `.close()` is this shared no-op: one own-property store per CFunction, no closure, no
+// FinalizationRegistry entry.
+function closeJSCFFICFunction() {}
 function CFunction(options) {
   const identifier = `CFunction${cFunctionI++}`;
+
+  // Fast path: create the JavaScriptCore-native FFI function straight from the descriptor -- no
+  // linkSymbols() object, FFI box or per-symbol map is built (and then thrown away) per call. The
+  // engine cell IS the callable: it must be returned as-is, never wrapped in another JS function
+  // (an extra frame per call costs more than the wrapper saves). `undefined` means this signature
+  // needs the TinyCC-era path below (napi_env/napi_value, cstring return, threadsafe, missing ptr,
+  // or the engine FFI is unavailable), which keeps every fallback behavior and error message.
+  const fn = nativeCFunction(options, identifier);
+  if (Error.isError(fn)) throw fn;
+  if (fn) {
+    fn.close = closeJSCFFICFunction;
+    return fn;
+  }
+
   var result = linkSymbols({
     [identifier]: options,
   });

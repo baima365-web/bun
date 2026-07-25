@@ -1913,6 +1913,55 @@ impl FFI {
         );
         js_object
     }
+
+    /// bun:ffi `CFunction()` fast path. Creates ONE engine-native (JavaScriptCore) FFI function
+    /// straight from a `{ ptr, args?, returns? }` descriptor: no `linkSymbols()` object, no `FFI`
+    /// box, no per-symbol map, nothing that has to be `close()`d (the engine cell is just GC'd).
+    ///
+    /// Returns the `JSFFIFunction` on success, an Error VALUE when validation fails (the JS glue
+    /// throws it, identical to the `linkSymbols()` messages since the same validation runs), or
+    /// `undefined` when this descriptor must instead take the TinyCC-era `linkSymbols()` path
+    /// (missing `ptr`, napi_env/napi_value or cstring in the signature, threadsafe, or the engine
+    /// FFI is unavailable / disabled) so the caller falls back with unchanged behavior.
+    pub fn create_cfunction(
+        global: &JSGlobalObject,
+        options: JSValue,
+        name_value: Option<JSValue>,
+    ) -> JsResult<JSValue> {
+        jsc::mark_binding();
+
+        if options.is_empty_or_undefined_or_null() || !options.is_object() || !jsc_ffi_enabled() {
+            return Ok(JSValue::UNDEFINED);
+        }
+
+        let mut function = Function::default();
+        if let Some(err) = generate_symbol_for_function(global, options, &mut function)? {
+            return Ok(err);
+        }
+        // A cstring return still needs the JS-side `CString` wrap and napi/threadsafe signatures
+        // need the TinyCC path: hand those (and a missing ptr, for its error message) back to the
+        // fallback rather than duplicating it here.
+        if !function.can_use_jsc_ffi() || function.return_type == ABIType::CString {
+            return Ok(JSValue::UNDEFINED);
+        }
+        let Some(target) = function.symbol_from_dynamic_library else {
+            return Ok(JSValue::UNDEFINED);
+        };
+
+        let name = match name_value {
+            Some(value) if value.is_string() => value.get_zig_string(global)?,
+            _ => ZigString::static_(b"CFunction"),
+        };
+        let cb = create_jsc_ffi_function(global, &name, &function, target);
+        if cb.is_empty() {
+            return Ok(if global.has_exception() {
+                global.take_error(JsError::Thrown) // ErrorInstance, so Error.isError() holds
+            } else {
+                global.to_invalid_arguments(format_args!("Failed to create FFI function"))
+            });
+        }
+        Ok(cb)
+    }
 }
 
 pub(super) fn generate_symbol_for_function(

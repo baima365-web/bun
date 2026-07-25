@@ -723,6 +723,144 @@ it(".ptr is not leaked", () => {
   }
 });
 
+// CString is a native class: a String object whose ptr / byteOffset / byteLength / arrayBuffer
+// are prototype accessors backed by the cell (no per-instance own properties). These pin down that
+// it stays string-like and API-compatible with the old `class CString extends String`.
+describe("CString", () => {
+  const hello = Buffer.from("Hello, world!\0", "utf8");
+  // A bun:ffi pointer does not root the memory it points at, and `hello` is otherwise reached only
+  // through `helloPtr` (a plain number). Keep the Buffer strongly reachable for the whole run so a
+  // GC between tests cannot free it out from under the CString reads below.
+  (globalThis.__ffiTestKeepAlive ??= []).push(hello);
+  const helloPtr = ptr(hello);
+
+  it("is string-like", () => {
+    const cs = new CString(helloPtr);
+    expect(String(cs)).toBe("Hello, world!");
+    expect(cs.toString()).toBe("Hello, world!");
+    expect(cs.valueOf()).toBe("Hello, world!");
+    expect(cs.length).toBe(13);
+    expect(cs[0]).toBe("H");
+    expect(cs + "").toBe("Hello, world!");
+    expect(cs + "!").toBe("Hello, world!!");
+    expect(`${cs}?`).toBe("Hello, world!?");
+    // eslint-disable-next-line eqeqeq
+    expect(cs == "Hello, world!").toBe(true);
+    expect(cs === "Hello, world!").toBe(false);
+    expect(cs.slice(7)).toBe("world!");
+    expect(cs.toUpperCase()).toBe("HELLO, WORLD!");
+    expect(JSON.stringify(cs)).toBe('"Hello, world!"');
+    expect(Object.prototype.toString.call(cs)).toBe("[object String]");
+    expect(typeof cs).toBe("object");
+  });
+
+  it("is an instance of CString and of String", () => {
+    const cs = new CString(helloPtr);
+    expect(cs).toBeInstanceOf(CString);
+    expect(cs).toBeInstanceOf(String);
+    expect(cs.constructor).toBe(CString);
+    expect(Object.getPrototypeOf(cs)).toBe(CString.prototype);
+    expect(Object.getPrototypeOf(CString.prototype)).toBe(String.prototype);
+    expect(Object.getPrototypeOf(CString)).toBe(String);
+    expect(CString.name).toBe("CString");
+  });
+
+  it("exposes ptr, byteOffset, byteLength through prototype accessors", () => {
+    const cs = new CString(helloPtr, 7, 5);
+    expect(String(cs)).toBe("world");
+    expect(cs.ptr).toBe(helloPtr);
+    expect(cs.byteOffset).toBe(7);
+    expect(cs.byteLength).toBe(5);
+
+    // Not own properties any more: the values live in the cell, the accessors on the prototype.
+    expect(Object.prototype.hasOwnProperty.call(cs, "ptr")).toBe(false);
+    for (const key of ["ptr", "byteOffset", "byteLength", "arrayBuffer"]) {
+      expect(Object.getOwnPropertyDescriptor(CString.prototype, key)?.get).toBeFunction();
+    }
+    expect("ptr" in cs).toBe(true);
+
+    const bare = new CString(helloPtr);
+    expect(bare.byteOffset).toBeUndefined();
+    expect(bare.byteLength).toBeUndefined();
+
+    // Still writable, like the old own data properties.
+    const writable = new CString(helloPtr);
+    writable.byteLength = 5;
+    expect(writable.byteLength).toBe(5);
+  });
+
+  it("arrayBuffer views the source memory and is cached", () => {
+    const cs = new CString(helloPtr, 0, 5);
+    expect(String(cs)).toBe("Hello");
+    expect(cs.arrayBuffer.byteLength).toBe(5);
+    expect(new TextDecoder().decode(cs.arrayBuffer)).toBe("Hello");
+    expect(cs.arrayBuffer).toBe(cs.arrayBuffer);
+    expect(new CString(0).arrayBuffer.byteLength).toBe(0);
+  });
+
+  it("a falsy pointer yields an empty string with ptr 0", () => {
+    for (const value of [0, null, undefined]) {
+      const cs = new CString(value);
+      expect(String(cs)).toBe("");
+      expect(cs.ptr).toBe(0);
+      expect(cs.length).toBe(0);
+    }
+  });
+
+  it("Bun.FFI.CString is the same constructor, callable with and without new", () => {
+    expect(Bun.FFI.CString).toBe(CString);
+    expect(String(new Bun.FFI.CString(helloPtr, 0, 5))).toBe("Hello");
+    expect(Bun.FFI.CString(helloPtr, 0, 5)).toBe("Hello");
+  });
+
+  it("can be subclassed", () => {
+    class MyCString extends CString {
+      shout() {
+        return `${this}!`.toUpperCase();
+      }
+    }
+    const cs = new MyCString(helloPtr);
+    expect(cs).toBeInstanceOf(MyCString);
+    expect(cs).toBeInstanceOf(CString);
+    expect(cs.shout()).toBe("HELLO, WORLD!!");
+    expect(cs.ptr).toBe(helloPtr);
+  });
+});
+
+describe("CFunction", () => {
+  it("returns the engine-native callable with a working .close()", () => {
+    const callback = new JSCallback(() => 42, { returns: "int32_t", args: [] });
+    try {
+      const fn = new CFunction({ ptr: callback.ptr, returns: "int32_t", args: [] });
+      expect(typeof fn).toBe("function");
+      expect(fn()).toBe(42);
+      expect(fn()).toBe(42);
+      expect(fn.close).toBeFunction();
+      expect(fn.close()).toBeUndefined();
+      // Idempotent: closing an already-closed CFunction is a no-op.
+      expect(fn.close()).toBeUndefined();
+    } finally {
+      callback.close();
+    }
+  });
+
+  it("passes arguments and marshals the return value", () => {
+    const add = new JSCallback((a, b) => a + b, { returns: "int32_t", args: ["int32_t", "int32_t"] });
+    try {
+      const fn = new CFunction({ ptr: add.ptr, returns: "int32_t", args: ["int32_t", "int32_t"] });
+      expect(fn(40, 2)).toBe(42);
+      expect(fn(-1, 1)).toBe(0);
+      fn.close();
+    } finally {
+      add.close();
+    }
+  });
+
+  it("reports a missing ptr the same way linkSymbols() does", () => {
+    expect(() => new CFunction({ returns: "int32_t", args: [] })).toThrow(/CFunction.*ptr.*(linkSymbols|CFunction)/);
+  });
+});
+
 // Runs in a subprocess: `bun test`'s exit path does not finalize the CFunction's native handle,
 // which the ASan lane's leak checker then reports against this file.
 it("JSCallback exceptions propagate out of the native call", async () => {
