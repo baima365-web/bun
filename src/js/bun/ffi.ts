@@ -337,19 +337,17 @@ function wrapSymbol(symbol, returnType, name) {
   return symbol;
 }
 
-// Accept both string names ("i32") and numeric tags (FFIType.i32); the numeric tags for the
-// cc()-only types (napi_env=18, napi_value=19) and buffer=20 have no reverse-mapping key in
-// FFIType, so normalize numeric tags to a canonical value before any lookup.
-const ffiTypeName = tag => (typeof tag === "number" ? (FFIType[tag] ?? tag) : tag);
+// Accept both string names ("i32") and numeric tags (FFIType.i32): resolve the numeric tag once,
+// since ffiWrappers is indexed by tag and the cc()-only types (napi_env=18, napi_value=19) and
+// buffer=20 have no reverse-mapping string key in FFIType.
 function FFIBuilder(params, returnType, functionToCall, name) {
-  returnType = ffiTypeName(returnType);
   const returnTag = typeof returnType === "number" ? returnType : FFIType[returnType];
   const hasReturnType = typeof returnTag === "number" && returnTag !== FFIType.void;
   var paramNames = new Array(params.length);
   var args = new Array(params.length);
   for (let i = 0; i < params.length; i++) {
     paramNames[i] = `p${i}`;
-    const param = ffiTypeName(params[i]);
+    const param = params[i];
     const wrapper = ffiWrappers[typeof param === "number" ? param : FFIType[param]];
     if (wrapper) {
       // doing this inline benchmarked about 4x faster than referencing

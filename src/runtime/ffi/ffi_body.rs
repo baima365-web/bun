@@ -131,8 +131,10 @@ unsafe extern "C" {
 
 /// Creates the JSC-native FFI function (the ONLY FFI symbol implementation) for `function`
 /// bound to `target`. `owner` is the JS object that owns the underlying resource (the FFI
-/// wrapper holding the library handle): the engine keeps it alive while any function referencing
-/// it is reachable, so GC-driven dlclose is safe by construction. napi types never reach here --
+/// wrapper holding the library handle): the engine keeps it alive while any function cell
+/// referencing it is reachable, so the wrapper is never finalized under a live function. It does
+/// NOT license GC-driven dlclose -- raw `.ptr` addresses can escape (see FFI::finalize).
+/// napi types never reach here --
 /// they are cc()-only and are rejected before this call. On engine-side failure (invalid
 /// signature / executable-memory OOM / no JIT) this returns an EMPTY `JSValue` with an
 /// exception pending; callers test `.is_empty()` and surface the error.
@@ -247,24 +249,20 @@ impl Default for FFI {
 
 impl FFI {
     pub fn finalize(self: Box<Self>) {
-        // dlopen()/linkSymbols(): each engine JSFFIFunction holds THIS wrapper as its GC owner
-        // (JSFFIFunction::m_owner write barrier), so the wrapper is only finalized once every
-        // function referencing it is unreachable. That makes GC-driven teardown safe: nothing
-        // can call into the library any more, so do_close() (dlclose + drop) is exactly what a
-        // forgotten close() should do -- the handle no longer leaks.
+        // INTENTIONAL leak when not close()d: teardown is owned by `close()`. GC-driven dlclose
+        // is UNSOUND here because addresses escape the GC's view: `symbol.ptr` may have been fed
+        // into CFunction()/linkSymbols(), stored inside a native library, or be executing on a
+        // thread the library spawned. Nothing the collector can see says whether the last
+        // consumer of an address is gone, so unmapping the library on GC would turn a bounded
+        // handle leak into a segfault (and would run the library's fini/destructor code inside
+        // a cell destructor, where re-entering the VM is forbidden). The JSFFIFunction owner
+        // barrier keeps this wrapper alive while its function CELLS are reachable, but it does
+        // not (and cannot) track those escaped raw addresses.
         //
-        // cc(): its symbols are TinyCC trampolines (Zig::JSFFIFunction) with NO owner barrier, so
-        // a JS-held function CAN outlive this wrapper; dropping the box would tcc_delete() the
-        // executable pages those functions still jump into. cc() wrappers own the shared TCC
-        // state, so keep the intentional leak for exactly that case (teardown stays owned by
-        // close()).
-        //
-        // When close() already ran, the maps are empty and the dylib / TCC state are gone, so
-        // the box only owns retained-capacity buffers: just drop it.
+        // When `close()` HAS run, the functions map is empty and the dylib / shared TCC state
+        // are already gone, so the Box only owns the (empty) hashmap's retained-capacity buffer.
+        // Drop it instead of leaking.
         if self.closed.get() {
-            drop(self);
-        } else if self.shared_state.get().is_none() {
-            self.do_close(); // GC-driven close, safe by the owner-barrier construction above
             drop(self);
         } else {
             let _ = bun_core::heap::release(self);
@@ -1585,7 +1583,7 @@ impl FFI {
         // The FFI wrapper is created FIRST (its function map filled in after the loop) so its JS
         // object can be the GC OWNER of every function: the engine keeps the wrapper -- and thus
         // the loaded library -- alive while any of its functions is reachable. GC-driven dlclose
-        // is therefore safe by construction (see FFI::finalize, which now closes on GC).
+        // is therefore safe by construction (the wrapper stays alive while any function cell does; teardown is still owned by close(), see FFI::finalize).
         // The wrapper is created BEFORE the loop (empty; `dylib` and `functions` installed after)
         // so its JS object can be each function's GC owner. The JS wrapper takes ownership of
         // the box, but the allocation is stable (the wrapper holds this very pointer; finalize
