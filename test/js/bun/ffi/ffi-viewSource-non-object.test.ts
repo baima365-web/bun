@@ -45,9 +45,11 @@ describe("FFI viewSource", () => {
     expect(src).toHaveLength(1);
     expect(src[0]).toContain("JSFunctionCall");
 
+    // Callbacks are JIT-compiled trampolines in the engine (JavaScriptCore); there is no
+    // generated C source for them any more, so viewSource(cb, true) returns an explanatory line.
     const cbSrc = viewSource({ args: ["i32"], returns: "i32" }, true);
     expect(typeof cbSrc).toBe("string");
-    expect(cbSrc).toContain("my_callback_function");
+    expect(cbSrc).toContain("compiled by JavaScriptCore");
   });
 });
 

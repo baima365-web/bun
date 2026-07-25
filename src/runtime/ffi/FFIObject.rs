@@ -908,17 +908,9 @@ mod fields {
         super::to_array_buffer(global, value, byte_offset, length, final_ctx, final_cb)
     }
 
-    // closeCallback → FFI::close_callback(global, JSValue) -> JSValue
-    pub(super) fn close_callback(
-        global: &JSGlobalObject,
-        callframe: &CallFrame,
-    ) -> JsResult<JSValue> {
-        let mut iter = callframe.arguments().iter();
-        let ctx = eat_required(global, &mut iter)?;
-        Ok(FfiImpl::close_callback(global, ctx))
-    }
-
-    // closeJSCCallback → FFI::close_jsc_callback(global, JSValue) -> JSValue
+    // closeCallback / closeJSCCallback → FFI::close_jsc_callback(global, JSValue) -> JSValue.
+    // There is one callback implementation now (the engine JSFFICallback cell); both field
+    // names route to the same idempotent closer.
     pub(super) fn close_jsc_callback(
         global: &JSGlobalObject,
         callframe: &CallFrame,
@@ -955,7 +947,7 @@ mod fields {
 // (item + cast), which const-eval rejects in array-literal position. The slice
 // is tiny and only built once in `to_js`, so the runtime cost is nil.
 #[allow(non_snake_case)]
-fn FIELDS() -> [(&'static str, jsc::JSHostFn); 9] {
+fn FIELDS() -> [(&'static str, jsc::JSHostFn); 8] {
     [
         ("viewSource", wrap_host_fn!(fields::view_source)),
         ("dlopen", wrap_host_fn!(fields::dlopen)),
@@ -963,11 +955,7 @@ fn FIELDS() -> [(&'static str, jsc::JSHostFn); 9] {
         ("linkSymbols", wrap_host_fn!(fields::link_symbols)),
         ("toBuffer", wrap_host_fn!(fields::to_buffer)),
         ("toArrayBuffer", wrap_host_fn!(fields::to_array_buffer)),
-        ("closeCallback", wrap_host_fn!(fields::close_callback)),
-        (
-            "closeJSCCallback",
-            wrap_host_fn!(fields::close_jsc_callback),
-        ),
+        ("closeCallback", wrap_host_fn!(fields::close_jsc_callback)),
         ("cfunction", wrap_host_fn!(fields::cfunction)),
     ]
 }

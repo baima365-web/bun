@@ -4,18 +4,19 @@
 // symbol with TinyCC. When the WebKit fork provides the engine-native FFI machinery
 // (JSC::JSFFIFunction / JSC::JSFFICallback under USE(BUN_JSC_ADDITIONS), described in
 // WebKit's docs/ffi/SPEC.md), Bun creates those instead: no TinyCC state per symbol, no
-// per-argument JS coercion wrappers, and DFG/FTL integration of the call sites. The Rust side
-// (src/runtime/ffi/ffi_body.rs) decides when this path is taken -- signatures without
-// napi_env/napi_value and non-threadsafe callbacks, unless the
-// BUN_FEATURE_FLAG_DISABLE_JSC_FFI escape hatch is set.
+// per-argument JS coercion wrappers, and DFG/FTL integration of the call sites. This is the ONLY
+// implementation for dlopen()/linkSymbols()/CFunction() symbols and for JSCallback (including
+// threadsafe callbacks); TinyCC remains solely as cc()'s C compiler.
 
 #include "root.h"
 
 #include <JavaScriptCore/BunFFI.h>
 #include <JavaScriptCore/FFISignature.h>
 #include <JavaScriptCore/FFIType.h>
+#include <JavaScriptCore/FFIContext.h>
 #include <JavaScriptCore/JSFFICallback.h>
 #include <JavaScriptCore/JSFFIFunction.h>
+#include "ScriptExecutionContext.h" 
 #include <JavaScriptCore/JSCJSValueInlines.h>
 #include <JavaScriptCore/JSCast.h>
 #include <JavaScriptCore/JSObject.h>
@@ -28,29 +29,23 @@
 // rather than a runtime miscompile.
 static_assert(static_cast<uint8_t>(JSC::FFI::Type::Char) == 0, "FFI::Type tag drift");
 static_assert(static_cast<uint8_t>(JSC::FFI::Type::Pointer) == 12, "FFI::Type tag drift");
-static_assert(static_cast<uint8_t>(JSC::FFI::Type::NapiValue) == 19, "FFI::Type tag drift");
+static_assert(static_cast<uint8_t>(JSC::FFI::Type::JSValue) == 19, "FFI::Type tag drift"); // was NapiValue: same tag, engine renamed it
 static_assert(static_cast<uint8_t>(JSC::FFI::Type::Buffer) == 20, "FFI::Type tag drift");
 
 // Creates a JSC-native FFI function for `target` with the given Bun ABIType tags. Returns the
 // encoded JSFFIFunction, or an empty value with an exception pending on failure (invalid
 // signature, executable-memory exhaustion). `argTypes` may be null when `argCount` is 0.
-// True iff the engine-native FFI is usable in this process (JIT enabled, executable allocator
-// initialized, supported build). Exactly the condition JSFFIFunction::create /
-// JSFFICallback::create enforce, so the caller can fall back to TinyCC instead of hitting the
-// "bun:ffi requires the JIT" TypeError (e.g. BUN_JSC_useJIT=0, or a locked-down environment
-// without executable memory).
-extern "C" bool Bun__JSCFFIIsAvailable()
-{
-    return JSC::FFI::isAvailable();
-}
-
+// `owner`: the JS object that owns the underlying resource (the dlopen'd library). The engine
+// keeps it alive via a write barrier for as long as ANY function referencing it is reachable, so
+// the owner's finalizer (dlclose) can only run once its last function is unreachable.
 extern "C" JSC::EncodedJSValue Bun__CreateJSCFFIFunction(
     Zig::GlobalObject* globalObject,
     const ZigString* symbolName,
     const uint8_t* argTypes,
     unsigned argCount,
     uint8_t returnType,
-    void* target)
+    void* target,
+    JSC::EncodedJSValue ownerValue)
 {
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
@@ -66,8 +61,10 @@ extern "C" JSC::EncodedJSValue Bun__CreateJSCFFIFunction(
         RELEASE_AND_RETURN(scope, {});
     }
 
+    JSC::JSObject* owner = JSC::JSValue::decode(ownerValue).getObject(); // nullable
+
     WTF::String name = symbolName ? Zig::toStringCopy(*symbolName) : WTF::String();
-    JSC::JSFFIFunction* function = JSC::FFI::createFunction(globalObject, signature.releaseNonNull(), target, name);
+    JSC::JSFFIFunction* function = JSC::JSFFIFunction::create(vm, globalObject, globalObject->ffiFunctionStructure(), signature.releaseNonNull(), target, name, owner, nullptr);
     RETURN_IF_EXCEPTION(scope, {});
     if (!function)
         RELEASE_AND_RETURN(scope, {});
@@ -81,16 +78,48 @@ extern "C" JSC::EncodedJSValue Bun__CreateJSCFFIFunction(
 }
 
 // Creates a JSC-native (non-threadsafe) FFI callback wrapping `callable`. Returns the encoded
-// JSFFICallback, whose read-only "ptr" property is the native entry point handed to C code.
+// ---- threadsafe callback dispatch ----
+// The engine calls this (possibly from a FOREIGN thread) when a threadsafe JSFFICallback is
+// entered natively. It carries only refcounted C data: the raw copied argument slots plus the
+// embedderContext we passed at creation, which is this callback's ScriptExecutionContext id.
+// We queue it to that context's JS thread and there call FFI::runThreadsafeInvocation, which
+// converts the slots to JS values and invokes the function -- so no JS value is ever created
+// off-thread. Refs the record across the queue; released when the task (or the drop on a dead
+// context) completes.
+static void Bun__jscFFIThreadsafeDispatch(JSC::FFI::ThreadsafeInvocation& invocation)
+{
+    // ScriptExecutionContextIdentifier is a uint32_t here: it round-trips losslessly through
+    // the opaque embedder-context pointer.
+    static_assert(sizeof(WebCore::ScriptExecutionContextIdentifier) <= sizeof(void*));
+    auto contextId = static_cast<WebCore::ScriptExecutionContextIdentifier>(reinterpret_cast<uintptr_t>(invocation.embedderContext()));
+    // Ref only once the context is found live (inside the map lock); the task adopts it, so the
+    // last deref happens on the JS thread. On a dead/terminating context nothing is queued.
+    WebCore::ScriptExecutionContext::postTaskTo(contextId, [&invocation] { invocation.ref(); }, [invocation = &invocation](WebCore::ScriptExecutionContext&) mutable {
+        Ref protectedInvocation = adoptRef(*invocation);
+        JSC::FFI::runThreadsafeInvocation(protectedInvocation.get());
+    });
+}
+
+// JSFFICallback (threadsafe or not, per the flag), whose read-only "ptr" property is the
+// native entry point handed to C code.
 extern "C" JSC::EncodedJSValue Bun__CreateJSCFFICallback(
     Zig::GlobalObject* globalObject,
     JSC::EncodedJSValue callableValue,
     const uint8_t* argTypes,
     unsigned argCount,
-    uint8_t returnType)
+    uint8_t returnType,
+    bool threadsafe)
 {
     auto& vm = JSC::getVM(globalObject);
     auto scope = DECLARE_THROW_SCOPE(vm);
+
+    if (threadsafe) {
+        // One process-wide dispatch; registered on first threadsafe creation (idempotent).
+        static std::once_flag registerDispatch;
+        std::call_once(registerDispatch, [] {
+            JSC::FFI::FFIContext::setThreadsafeDispatch(Bun__jscFFIThreadsafeDispatch);
+        });
+    }
 
     JSC::JSObject* callable = JSC::JSValue::decode(callableValue).getObject();
     if (!callable || !callable->isCallable()) [[unlikely]] {
@@ -109,7 +138,19 @@ extern "C" JSC::EncodedJSValue Bun__CreateJSCFFICallback(
         RELEASE_AND_RETURN(scope, {});
     }
 
-    JSC::JSFFICallback* callback = JSC::FFI::createCallback(globalObject, signature.releaseNonNull(), callable);
+    void* embedderContext = nullptr;
+    if (threadsafe) {
+        // The context id is a small integral identifier: pass it through the engine as the
+        // opaque embedder pointer; Bun__jscFFIThreadsafeDispatch reads it back on the foreign
+        // thread without touching any JS state.
+        auto* scriptExecutionContext = globalObject->scriptExecutionContext();
+        if (!scriptExecutionContext) [[unlikely]] {
+            JSC::throwTypeError(globalObject, scope, "bun:ffi: no script execution context for a threadsafe JSCallback"_s);
+            RELEASE_AND_RETURN(scope, {});
+        }
+        embedderContext = reinterpret_cast<void*>(static_cast<uintptr_t>(scriptExecutionContext->identifier()));
+    }
+    JSC::JSFFICallback* callback = JSC::FFI::createCallback(globalObject, signature.releaseNonNull(), callable, threadsafe, embedderContext);
     RETURN_IF_EXCEPTION(scope, {});
     if (!callback)
         RELEASE_AND_RETURN(scope, {});

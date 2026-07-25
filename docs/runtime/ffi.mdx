@@ -149,10 +149,16 @@ The following `FFIType` values are supported.
 | f64        | `double`       | `double`                    |
 | bool       | `bool`         |                             |
 | char       | `char`         |                             |
-| napi_env   | `napi_env`     |                             |
-| napi_value | `napi_value`   |                             |
+| napi_env   | `napi_env`     | `cc()` only                 |
+| napi_value | `napi_value`   | `cc()` only                 |
 
 `buffer` arguments must be a `TypedArray` or `DataView`.
+
+`napi_env` and `napi_value` are only valid in [`cc()`](/runtime/c-compiler) source, where a
+`napi_env` parameter is filled in with the module's environment by the compiled trampoline (the
+JavaScript argument passed at that position is a placeholder and is ignored) and `napi_value`
+passes the JavaScript value through unchanged. Using either type in a `dlopen`, `linkSymbols`,
+or `CFunction` descriptor throws a `TypeError`.
 
 ---
 

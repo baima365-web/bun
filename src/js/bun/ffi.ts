@@ -75,34 +75,30 @@ const nativeLinkSymbols = ffi.linkSymbols;
 const nativeDLOpen = ffi.dlopen;
 const nativeCallback = ffi.callback;
 const closeCallback = ffi.closeCallback;
-const closeJSCCallback = ffi.closeJSCCallback;
 const nativeCFunction = ffi.cfunction;
 delete ffi.callback;
 delete ffi.closeCallback;
-delete ffi.closeJSCCallback;
 delete ffi.cfunction;
 
+// A JSCallback IS the engine's JSC::JSFFICallback cell: the constructor returns the cell that
+// bun:ffi created (constructors may return an object). `.ptr` and `.threadsafe` are the cell's
+// own properties; `close()` is THIS class's prototype method. One callback implementation for
+// normal and `threadsafe` cases. An UN-CLOSED callback is kept alive by the engine (native code
+// may hold `.ptr` with no JS reference), so `close()` is how you release one -- exactly the
+// prior contract, now enforced by the GC instead of by a leak. Threadsafe callbacks invoked from
+// a foreign thread are marshalled onto this JS thread by the engine; the C caller receives 0.
 class JSCallback {
   constructor(cb, options) {
-    const result = nativeCallback(options, cb);
-    if (Error.isError(result)) throw result;
-    const { ctx, ptr, jsc } = result;
-    this.#ctx = ctx;
-    // JavaScriptCore-native FFI callback: the engine cell (JSFFICallback) owns the JIT'd
-    // C-callable trampoline and roots the JS function; keeping a reference here keeps the
-    // native entry point valid for as long as this JSCallback is alive.
-    this.#jsc = jsc;
-    this.ptr = ptr;
-    this.#threadsafe = !!options?.threadsafe;
-  }
-
-  ptr;
-  #ctx;
-  #jsc;
-  #threadsafe;
-
-  get threadsafe() {
-    return this.#threadsafe;
+    const cell = nativeCallback(options, cb);
+    if (Error.isError(cell)) throw cell;
+    // `cell` is the JSC::JSFFICallback cell. Adopt `new.target.prototype` (not just
+    // JSCallback.prototype) so `instanceof` and SUBCLASSES both work: a
+    // `class Foo extends JSCallback` gets Foo.prototype and its own methods/overrides -- the
+    // engine cell carries `ptr`/`threadsafe` as own DATA properties but NO own `close`, so this
+    // class's prototype close() (and any subclass override / Symbol.dispose) is what resolves.
+    // Return the cell in place of the freshly-allocated `this` (which is discarded).
+    Object.setPrototypeOf(cell, (new.target ?? JSCallback).prototype);
+    return cell;
   }
 
   [Symbol.toPrimitive]() {
@@ -111,17 +107,13 @@ class JSCallback {
   }
 
   close() {
-    const ctx = this.#ctx;
-    const jsc = this.#jsc;
-    this.ptr = null;
-    this.#ctx = null;
-    this.#jsc = null;
-
-    if (ctx) {
-      closeCallback(ctx);
-    } else if (jsc) {
-      closeJSCCallback(jsc);
+    // The receiver must be an engine JSFFICallback cell (this class's instances ARE the
+    // cell). A foreign receiver -- JSCallback.prototype.close.call({}) -- is a TypeError, as
+    // it was for the old class, instead of a silent no-op inside the engine's downcast.
+    if (!(this instanceof JSCallback)) {
+      throw new TypeError("JSCallback.prototype.close called on an incompatible receiver");
     }
+    closeCallback(this);
   }
 
   [Symbol.dispose]() {
@@ -147,6 +139,12 @@ const ffiWrappers = new Array(21);
 
 var char = "val|0";
 ffiWrappers.fill(char);
+// napi types are pass-through: `napi_value` IS the raw JS value (no numeric coercion), and a
+// `napi_env` argument is injected by the cc() trampoline (the JS-side placeholder is ignored).
+// Without explicit entries these indices inherited the char/int32 `val|0` coercion, which
+// mangled objects/strings into 0. (napi types are only valid in cc().)
+ffiWrappers[FFIType.napi_env] = "val";
+ffiWrappers[FFIType.napi_value] = "val";
 ffiWrappers[FFIType.uint8_t] = "val<0?0:val>=255?255:val|0";
 ffiWrappers[FFIType.int16_t] = "val<=-32768?-32768:val>=32768?32768:val|0";
 ffiWrappers[FFIType.uint16_t] = "val<=0?0:val>=65536?65536:val|0";
@@ -321,46 +319,38 @@ ffiWrappers[FFIType.function] = `{
   return ptr;
 }`;
 
-// Wraps a native symbol for JS consumption. `shouldWrap` comes from the native side (dlopen /
-// linkSymbols report which symbols are engine-native): JavaScriptCore-native FFI functions do
-// argument conversion, arity handling and result boxing in the engine itself -- and their call
-// sites are compiled into DFG/FTL CallFFI nodes -- so they get NO per-argument coercion shim;
-// only a `cstring` return still gets the CString wrap. Everything else (napi_env/napi_value
-// signatures, threadsafe callbacks, or the BUN_FEATURE_FLAG_DISABLE_JSC_FFI escape hatch) goes
-// through the TinyCC-era FFIBuilder.
-function wrapSymbol(symbol, params, returnType, name, shouldWrap: boolean) {
-  if (!shouldWrap) {
-    if (FFIType[returnType as string] === FFIType.cstring) {
-      // Only a cstring return needs a JS wrapper; the arrow (a plain function object) carries
-      // .native/.ptr as own properties like any other symbol.
-      const wrapped = (...args) => new __GlobalBunCString(symbol(...args));
-      Object.defineProperty(wrapped, "name", { value: name });
-      wrapped.ptr = symbol.ptr;
-      wrapped.native = symbol;
-      return wrapped;
-    }
-    // The engine serves .native (=== the function itself) and .ptr as intrinsic properties of
-    // the JSFFIFunction cell (JSFFIFunction::getOwnPropertySlot), so nothing is written here:
-    // an own-property write would transition the cell's Structure and slow polymorphic call sites.
-    return symbol;
+// Wraps a native symbol for JS consumption. Every dlopen/linkSymbols/CFunction symbol is an
+// engine-native JSC::JSFFIFunction: the engine does argument conversion, arity handling and
+// result boxing (and hot call sites compile into DFG/FTL CallFFI nodes), so there is NO
+// per-argument JS coercion shim. The cell serves `.native` (=== the function) and `.ptr` as
+// intrinsic properties, so nothing is written onto it -- an own-property write would transition
+// the cell's Structure and slow polymorphic call sites. Only a `cstring` return still needs a
+// tiny wrapper to construct the CString from the returned raw pointer.
+function wrapSymbol(symbol, returnType, name) {
+  if (FFIType[returnType as string] === FFIType.cstring) {
+    const wrapped = (...args) => new __GlobalBunCString(symbol(...args));
+    Object.defineProperty(wrapped, "name", { value: name });
+    wrapped.ptr = symbol.ptr;
+    wrapped.native = symbol;
+    return wrapped;
   }
-
-  if (params?.length || FFIType[returnType as string] === FFIType.cstring) {
-    return FFIBuilder(params ?? [], returnType, symbol, name);
-  }
-
-  // consistentcy
-  symbol.native = symbol;
   return symbol;
 }
 
+// Accept both string names ("i32") and numeric tags (FFIType.i32); the numeric tags for the
+// cc()-only types (napi_env=18, napi_value=19) and buffer=20 have no reverse-mapping key in
+// FFIType, so normalize numeric tags to a canonical value before any lookup.
+const ffiTypeName = tag => (typeof tag === "number" ? (FFIType[tag] ?? tag) : tag);
 function FFIBuilder(params, returnType, functionToCall, name) {
-  const hasReturnType = typeof FFIType[returnType] === "number" && FFIType[returnType as string] !== FFIType.void;
+  returnType = ffiTypeName(returnType);
+  const returnTag = typeof returnType === "number" ? returnType : FFIType[returnType];
+  const hasReturnType = typeof returnTag === "number" && returnTag !== FFIType.void;
   var paramNames = new Array(params.length);
   var args = new Array(params.length);
   for (let i = 0; i < params.length; i++) {
     paramNames[i] = `p${i}`;
-    const wrapper = ffiWrappers[FFIType[params[i]]];
+    const param = ffiTypeName(params[i]);
+    const wrapper = ffiWrappers[typeof param === "number" ? param : FFIType[param]];
     if (wrapper) {
       // doing this inline benchmarked about 4x faster than referencing
       args[i] = `(val=>${wrapper})(p${i})`;
@@ -371,7 +361,7 @@ function FFIBuilder(params, returnType, functionToCall, name) {
 
   var code = `functionToCall(${args.join(", ")})`;
   if (hasReturnType) {
-    if (FFIType[returnType as string] === FFIType.cstring) {
+    if (returnTag === FFIType.cstring) {
       code = `return new __GlobalBunCString(${code})`;
     } else {
       code = `return ${code}`;
@@ -466,15 +456,9 @@ function dlopen(path, options) {
   const result = nativeDLOpen(path, options);
   if (Error.isError(result)) throw result;
 
-  // The native side reports which symbols are engine-native (need no JS coercion wrapper).
-  const jscSymbols = result.jscSymbols;
-  delete result.jscSymbols;
-
   for (let key in result.symbols) {
-    var symbol = result.symbols[key];
     result.symbols[key] = wrapSymbol(
-      symbol,
-      options[key]?.args ?? [],
+      result.symbols[key],
       options[key]?.returns ?? FFIType.void,
       // in stacktraces:
       // instead of
@@ -482,7 +466,6 @@ function dlopen(path, options) {
       // we want
       //    "sqlite3_get_version() - sqlit3.so"
       path.includes("/") ? `${key} (${path.split("/").pop()})` : `${key} (${path})`,
-      !(jscSymbols && jscSymbols[key] === true),
     );
   }
 
@@ -516,10 +499,14 @@ function cc(options) {
 
   for (let key in result.symbols) {
     var symbol = result.symbols[key];
-    if (options[key]?.args?.length || FFIType[options[key]?.returns as string] === FFIType.cstring) {
+    // cc()'s descriptors live under options.symbols (NOT options[key], which is what an
+    // earlier version read -- making this branch unreachable, so a cstring-returning cc symbol
+    // returned the raw pointer number instead of a CString).
+    const desc = options.symbols?.[key];
+    if (desc?.args?.length || FFIType[desc?.returns as string] === FFIType.cstring) {
       result.symbols[key] = FFIBuilder(
-        options[key].args ?? [],
-        options[key].returns ?? FFIType.void,
+        desc.args ?? [],
+        desc.returns ?? FFIType.void,
         symbol,
         // in stacktraces:
         // instead of
@@ -551,65 +538,29 @@ function linkSymbols(options) {
   const result = nativeLinkSymbols(options);
   if (Error.isError(result)) throw result;
 
-  const jscSymbols = result.jscSymbols;
-  delete result.jscSymbols;
-
   for (let key in result.symbols) {
-    var symbol = result.symbols[key];
-    result.symbols[key] = wrapSymbol(
-      symbol,
-      options[key]?.args ?? [],
-      options[key]?.returns ?? FFIType.void,
-      key,
-      !(jscSymbols && jscSymbols[key] === true),
-    );
+    result.symbols[key] = wrapSymbol(result.symbols[key], options[key]?.returns ?? FFIType.void, key);
   }
 
   return result;
 }
 
 var cFunctionI = 0;
-var cFunctionRegistry;
-function onCloseCFunction(close) {
-  close();
-}
-// The engine-native FFI function returned on the fast path owns nothing that has to be freed (no
-// TinyCC state, no library handle -- the cell and its JIT'd stub are garbage collected), so its
-// `.close()` is this shared no-op: one own-property store per CFunction, no closure, no
-// FinalizationRegistry entry.
+// CFunction().close(): the engine cell owns nothing that must be freed eagerly (it is GC'd), so
+// close is a documented no-op kept for API compatibility.
 function closeJSCFFICFunction() {}
 function CFunction(options) {
   const identifier = `CFunction${cFunctionI++}`;
 
-  // Fast path: create the JavaScriptCore-native FFI function straight from the descriptor -- no
-  // linkSymbols() object, FFI box or per-symbol map is built (and then thrown away) per call. The
-  // engine cell IS the callable: it must be returned as-is, never wrapped in another JS function
-  // (an extra frame per call costs more than the wrapper saves). `undefined` means this signature
-  // needs the TinyCC-era path below (napi_env/napi_value, cstring return, threadsafe, missing ptr,
-  // or the engine FFI is unavailable), which keeps every fallback behavior and error message.
+  // The engine cell IS the callable and is returned as-is -- never wrapped in another JS
+  // function (an extra frame per call costs more than any wrapper saves). There is no other
+  // implementation: nativeCFunction returns the JSC::JSFFIFunction, or an Error to throw.
   const fn = nativeCFunction(options, identifier);
-  if (Error.isError(fn)) throw fn;
-  if (fn) {
-    fn.close = closeJSCFFICFunction;
-    return fn;
-  }
-
-  var result = linkSymbols({
-    [identifier]: options,
-  });
-  var hasClosed = false;
-  var close = result.close.bind(result);
-  result.symbols[identifier].close = () => {
-    if (hasClosed || !close) return;
-    hasClosed = true;
-    close();
-    close = undefined;
-  };
-
-  cFunctionRegistry ||= new FinalizationRegistry(onCloseCFunction);
-  cFunctionRegistry.register(result.symbols[identifier], result.symbols[identifier].close);
-
-  return result.symbols[identifier];
+  if (Error.isError(fn)) throw fn; // includes the missing-ptr / bad-descriptor errors
+  // A cstring return still wants the CString-constructing wrapper (identical to dlopen symbols).
+  const symbol = wrapSymbol(fn, options?.returns ?? FFIType.void, identifier);
+  symbol.close = closeJSCFFICFunction; // nothing to free on the engine path; the cell is GC'd
+  return symbol;
 }
 
 const read = ffi.read;

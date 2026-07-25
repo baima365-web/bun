@@ -34,29 +34,6 @@ fn dir_exists(path: &'static [u8]) -> bool {
     bun_sys::directory_exists_at(bun_sys::Fd::cwd(), &z).unwrap_or(false)
 }
 
-/// `JSValue.createObject2` — local extern thunk; upstream `bun_jsc` hasn't
-/// re-exported it yet.
-#[inline]
-fn create_object_2(
-    global: &JSGlobalObject,
-    key1: &ZigString,
-    key2: &ZigString,
-    value1: JSValue,
-    value2: JSValue,
-) -> JSValue {
-    unsafe extern "C" {
-        fn JSC__JSValue__createObject2(
-            global: *const JSGlobalObject,
-            key1: *const ZigString,
-            key2: *const ZigString,
-            value1: JSValue,
-            value2: JSValue,
-        ) -> JSValue;
-    }
-    // SAFETY: all pointers borrowed for the call; C++ clones key strings.
-    unsafe { JSC__JSValue__createObject2(global, key1, key2, value1, value2) }
-}
-
 /// `bun.String.toJSArray` — local shim over `JSValue::create_array_from_iter`.
 fn strings_to_js_array(global: &JSGlobalObject, strs: &[bun_core::String]) -> JsResult<JSValue> {
     JSValue::create_array_from_iter(global, strs.iter(), |s| {
@@ -114,14 +91,6 @@ unsafe extern "C" {
     fn bun_ffi_ensure_offsets_are_loaded();
 }
 
-// ─── Engine-native FFI availability ──
-unsafe extern "C" {
-    /// `JSC::FFI::isAvailable()` — the JIT is enabled AND the executable allocator initialized
-    /// AND this is a supported build. When false the engine's create() functions throw, so we
-    /// route to the TinyCC path instead of surfacing "bun:ffi requires the JIT" to the user.
-    fn Bun__JSCFFIIsAvailable() -> bool;
-}
-
 // ─── Local extern thin-wrappers (codegen / `bun_jsc` surface not yet wired) ──
 unsafe extern "C" {
     /// `host_fn::NewRuntimeFunction` — `Bun__CreateFFIFunctionValue`.
@@ -145,9 +114,10 @@ unsafe extern "C" {
         arg_count: u32,
         return_type: u8,
         target: *mut c_void,
+        owner: JSValue,
     ) -> JSValue;
 
-    /// JavaScriptCore-native FFI: creates a non-threadsafe `JSC::JSFFICallback`
+    /// JavaScriptCore-native FFI: creates a `JSC::JSFFICallback` (threadsafe per the flag)
     /// wrapping `callable`; its read-only `.ptr` is the native entry point.
     fn Bun__CreateJSCFFICallback(
         global: *const JSGlobalObject,
@@ -155,39 +125,23 @@ unsafe extern "C" {
         arg_types: *const u8,
         arg_count: u32,
         return_type: u8,
+        threadsafe: bool,
     ) -> JSValue;
 }
 
-/// Whether bun:ffi should build the JavaScriptCore-native FFI object (engine-JIT'd stubs,
-/// engine-side argument coercion, DFG/FTL `CallFFI` integration) instead of the TinyCC-compiled
-/// trampoline. Enabled unless the `BUN_FEATURE_FLAG_DISABLE_JSC_FFI` escape hatch is set; the
-/// per-symbol eligibility checks (napi_env/napi_value, threadsafe) are the callers' concern.
-#[inline]
-fn jsc_ffi_enabled() -> bool {
-    if bun_core::env_var::feature_flag::BUN_FEATURE_FLAG_DISABLE_JSC_FFI
-        .get()
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    // Fall back to TinyCC whenever the engine could not run the FFI machinery (JIT disabled via
-    // BUN_JSC_useJIT=0, executable allocator failed, or an unsupported build) -- the engine would
-    // otherwise throw "bun:ffi requires the JIT" and dlopen would fail with no fallback. Availability
-    // is fixed for the process's lifetime, so query the engine once and cache it.
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // SAFETY: a plain by-value query into JSC with no arguments and no side effects.
-    *AVAILABLE.get_or_init(|| unsafe { Bun__JSCFFIIsAvailable() })
-}
-
-/// Creates the JSC-native FFI function for `function` bound to `target` and returns it, or
-/// Callers check `Function::can_use_jsc_ffi()` before calling this. On engine-side failure
-/// (invalid signature / executable-memory OOM) this returns an EMPTY `JSValue` with an
-/// exception pending on `global`; callers test `.is_empty()` and surface the error.
+/// Creates the JSC-native FFI function (the ONLY FFI symbol implementation) for `function`
+/// bound to `target`. `owner` is the JS object that owns the underlying resource (the FFI
+/// wrapper holding the library handle): the engine keeps it alive while any function referencing
+/// it is reachable, so GC-driven dlclose is safe by construction. napi types never reach here --
+/// they are cc()-only and are rejected before this call. On engine-side failure (invalid
+/// signature / executable-memory OOM / no JIT) this returns an EMPTY `JSValue` with an
+/// exception pending; callers test `.is_empty()` and surface the error.
 fn create_jsc_ffi_function(
     global: &JSGlobalObject,
     symbol_name: &ZigString,
     function: &Function,
     target: *mut c_void,
+    owner: JSValue,
 ) -> JSValue {
     let arg_types: Vec<u8> = function.arg_types.iter().map(|t| *t as u8).collect();
     // SAFETY: `global` is a live JSC handle; `arg_types` is a valid slice for `arg_types.len()`
@@ -204,6 +158,7 @@ fn create_jsc_ffi_function(
             u32::try_from(arg_types.len()).expect("int cast"),
             function.return_type as u8,
             target,
+            owner,
         )
     }
 }
@@ -292,17 +247,24 @@ impl Default for FFI {
 
 impl FFI {
     pub fn finalize(self: Box<Self>) {
-        // INTENTIONAL no-op when not closed. Compiled trampolines / dlopen'd
-        // symbols may still be reachable from JS after the wrapper is GC'd
-        // (e.g. `const { fn } = dlopen(...).symbols`); teardown is owned by
-        // `close()`. Dropping the Box would run `Function::drop` →
-        // `tcc_delete()`, freeing the executable pages those JSFunctions still
-        // jump into.
+        // dlopen()/linkSymbols(): each engine JSFFIFunction holds THIS wrapper as its GC owner
+        // (JSFFIFunction::m_owner write barrier), so the wrapper is only finalized once every
+        // function referencing it is unreachable. That makes GC-driven teardown safe: nothing
+        // can call into the library any more, so do_close() (dlclose + drop) is exactly what a
+        // forgotten close() should do -- the handle no longer leaks.
         //
-        // When `close()` HAS run, the functions map is empty and the dylib /
-        // shared TCC state are already gone, so the Box only owns the (empty)
-        // hashmap's retained-capacity buffer. Drop it instead of leaking.
+        // cc(): its symbols are TinyCC trampolines (Zig::JSFFIFunction) with NO owner barrier, so
+        // a JS-held function CAN outlive this wrapper; dropping the box would tcc_delete() the
+        // executable pages those functions still jump into. cc() wrappers own the shared TCC
+        // state, so keep the intentional leak for exactly that case (teardown stays owned by
+        // close()).
+        //
+        // When close() already ran, the maps are empty and the dylib / TCC state are gone, so
+        // the box only owns retained-capacity buffers: just drop it.
         if self.closed.get() {
+            drop(self);
+        } else if self.shared_state.get().is_none() {
+            self.do_close(); // GC-driven close, safe by the owner-barrier construction above
             drop(self);
         } else {
             let _ = bun_core::heap::release(self);
@@ -1336,12 +1298,6 @@ impl FFI {
         Ok(js_object)
     }
 
-    pub fn close_callback(_global_this: &JSGlobalObject, ctx: JSValue) -> JSValue {
-        // SAFETY: ctx encodes a heap::alloc(*mut Function) created by `callback`
-        drop(unsafe { bun_core::heap::take(ctx.as_ptr_address() as *mut Function) });
-        JSValue::UNDEFINED
-    }
-
     /// Closes a JavaScriptCore-native FFI callback (`JSC::JSFFICallback`, created by
     /// `Bun__CreateJSCFFICallback`). Idempotent; the engine keeps the trampoline code alive with
     /// the cell so native code that still holds the pointer does not jump into freed memory.
@@ -1359,11 +1315,6 @@ impl FFI {
         interface: JSValue,
         js_callback: JSValue,
     ) -> JsResult<JSValue> {
-        if !bun_core::Environment::ENABLE_TINYCC {
-            return Err(global_this.throw(format_args!(
-                "bun:ffi callback() is not available in this build (TinyCC is disabled)"
-            )));
-        }
         jsc::mark_binding();
         if !interface.is_object() {
             return Ok(global_this.to_invalid_arguments(format_args!("Expected object")));
@@ -1388,99 +1339,62 @@ impl FFI {
         func.base_name = Some(ZBox::from_bytes(b""));
         js_callback.ensure_still_alive();
 
-        // JavaScriptCore-native FFI callback (non-threadsafe): the engine JITs the C-callable
-        // trampoline and owns the JS function; no TinyCC state and no Rust-side Function box.
-        if func.can_use_jsc_ffi() {
-            let arg_types: Vec<u8> = func.arg_types.iter().map(|t| *t as u8).collect();
-            // SAFETY: `global_this` is a live JSC handle; `js_callback` is a callable JSValue kept
-            // alive above; `arg_types` is valid for `arg_types.len()` elements.
-            let cb = unsafe {
-                Bun__CreateJSCFFICallback(
-                    global_this,
-                    js_callback,
-                    if arg_types.is_empty() {
-                        core::ptr::null()
-                    } else {
-                        arg_types.as_ptr()
-                    },
-                    u32::try_from(arg_types.len()).expect("int cast"),
-                    func.return_type as u8,
-                )
-            };
-            if cb.is_empty() {
-                return Ok(if global_this.has_exception() {
-                    // take_error (not take_exception): unwrap the JSC::Exception wrapper cell to
-                    // the ErrorInstance so the glue's Error.isError() sees a real error.
-                    global_this.take_error(JsError::Thrown)
-                } else {
-                    ZigString::init(b"Failed to create FFI callback").to_error_instance(global_this)
-                });
-            }
-            // Shape the JS class already consumes: { ptr, ctx } -- plus `jsc`, the engine cell the
-            // JSCallback object keeps alive; `ctx` is null so close() takes the JSC branch.
-            let ptr_value = cb
-                .get_own(global_this, &bun_core::String::borrow_utf8(b"ptr"))?
-                .unwrap_or(JSValue::UNDEFINED);
-            let result = create_object_2(
+        // The engine callback (JSFFICallback cell) is the ONE implementation: it JITs the
+        // C-callable trampoline, owns and roots the JS function, and -- for `threadsafe` --
+        // marshals foreign-thread invocations to the JS thread via the dispatch registered in
+        // JSCFFIBridge.cpp. The returned cell IS the JSCallback object (the JS class's
+        // constructor returns it), so its `.ptr` / `.threadsafe` are the cell's own; `close()` is the JS class's prototype method.
+        let arg_types: Vec<u8> = func.arg_types.iter().map(|t| *t as u8).collect();
+        // SAFETY: `global_this` is a live JSC handle; `js_callback` is a callable JSValue kept
+        // alive above; `arg_types` is valid for `arg_types.len()` elements.
+        let cb = unsafe {
+            Bun__CreateJSCFFICallback(
                 global_this,
-                &ZigString::static_(b"ptr"),
-                &ZigString::static_(b"ctx"),
-                ptr_value,
-                JSValue::NULL,
-            );
-            result.put(global_this, ZigString::static_(b"jsc").slice(), cb);
-            return Ok(result);
-        }
-
-        if func
-            .compile_callback(global_this, js_callback, func.threadsafe)
-            .is_err()
-        {
-            return Ok(ZigString::init(b"Out of memory").to_error_instance(global_this));
-        }
-        match &func.step {
-            Step::Failed { msg, .. } => {
-                let message = ZigString::init(msg).to_error_instance(global_this);
-                Ok(message)
-            }
-            Step::Pending => Ok(ZigString::init(
-                b"Failed to compile, but not sure why. Please report this bug",
+                js_callback,
+                if arg_types.is_empty() {
+                    core::ptr::null()
+                } else {
+                    arg_types.as_ptr()
+                },
+                u32::try_from(arg_types.len()).expect("int cast"),
+                func.return_type as u8,
+                func.threadsafe,
             )
-            .to_error_instance(global_this)),
-            Step::Compiled(_) => {
-                let function_ = bun_core::heap::into_raw(Box::new(core::mem::take(func)));
-                // SAFETY: function_ is a valid heap::alloc pointer
-                let compiled_ptr = unsafe { (*function_).step.compiled_ptr() };
-                Ok(create_object_2(
-                    global_this,
-                    &ZigString::static_(b"ptr"),
-                    &ZigString::static_(b"ctx"),
-                    JSValue::from_ptr_address(compiled_ptr as usize),
-                    JSValue::from_ptr_address(function_ as usize),
-                ))
-            }
+        };
+        if cb.is_empty() {
+            return Ok(if global_this.has_exception() {
+                // take_error (not take_exception): unwrap the JSC::Exception wrapper cell to
+                // the ErrorInstance so the glue's Error.isError() sees a real error.
+                global_this.take_error(JsError::Thrown)
+            } else {
+                ZigString::init(b"Failed to create FFI callback").to_error_instance(global_this)
+            });
         }
+        Ok(cb)
     }
 
     #[bun_jsc::host_fn(method)]
     pub fn close(&self, _global_this: &JSGlobalObject, _: &CallFrame) -> JsResult<JSValue> {
         jsc::mark_binding();
+        self.do_close();
+        Ok(JSValue::UNDEFINED)
+    }
+
+    /// Idempotent teardown: dlclose the library, destroy any shared TCC state (cc()), and drop
+    /// the function map. Also the error path when symbol creation fails mid-open.
+    fn do_close(&self) {
         if self.closed.get() {
-            return Ok(JSValue::UNDEFINED);
+            return;
         }
         self.closed.set(true);
         if let Some(dylib) = self.dylib.replace(None) {
             dylib.close();
         }
-
         if let Some(state) = self.shared_state.take() {
             // SAFETY: state is a valid TCC::State pointer; we have exclusive ownership
             unsafe { TCC::State::destroy(state.as_ptr()) };
         }
-
         self.functions.with_mut(|f| f.clear_retaining_capacity());
-
-        Ok(JSValue::UNDEFINED)
     }
 
     pub fn print_callback(global: &JSGlobalObject, object: JSValue) -> JSValue {
@@ -1497,17 +1411,13 @@ impl FFI {
             return val;
         }
 
-        let mut arraylist: Vec<u8> = Vec::new();
-
-        function.base_name = Some(ZBox::from_bytes(b"my_callback_function"));
-
-        if function
-            .print_callback_source_code(None, None, &mut arraylist)
-            .is_err()
-        {
-            return ZigString::init(b"Error while printing code").to_error_instance(global);
-        }
-        jsc::bun_string_jsc::create_utf8_for_js(global, &arraylist).unwrap_or(JSValue::ZERO)
+        // Callbacks are engine-JIT'd trampolines (JSC::JSFFICallback); there is no generated C
+        // source to show any more (there is no generated C for callbacks). Keep the argument
+        // validation above; report what the trampoline is.
+        let _ = function;
+        let text: &[u8] =
+            b"// bun:ffi callbacks are compiled by JavaScriptCore (no C source is generated)\n";
+        jsc::bun_string_jsc::create_utf8_for_js(global, text).unwrap_or(JSValue::ZERO)
     }
 
     pub fn print(
@@ -1568,12 +1478,6 @@ fn invalid_options_arg(global: &JSGlobalObject) -> JSValue {
 
 impl FFI {
     pub fn open(global: &JSGlobalObject, name_str: ZigString, object_value: JSValue) -> JSValue {
-        if !bun_core::Environment::ENABLE_TINYCC {
-            let _ = global.throw(format_args!(
-                "bun:ffi dlopen() is not available in this build (TinyCC is disabled)"
-            ));
-            return JSValue::ZERO;
-        }
         jsc::mark_binding();
         let vm = jsc::VirtualMachineRef::get();
         let name_slice = name_str.to_slice();
@@ -1678,11 +1582,21 @@ impl FFI {
         let obj = JSValue::create_empty_object(global, size);
         let _obj_guard = obj.protected();
 
-        let napi_env = make_napi_env_if_needed(symbols.values(), global);
-
-        // Per-symbol map (name -> true) of symbols served by the JavaScriptCore-native FFI, so the
-        // JS glue knows which ones need no coercion wrapper without sniffing the function objects.
-        let jsc_symbols = JSValue::create_empty_object(global, symbols.len());
+        // The FFI wrapper is created FIRST (its function map filled in after the loop) so its JS
+        // object can be the GC OWNER of every function: the engine keeps the wrapper -- and thus
+        // the loaded library -- alive while any of its functions is reachable. GC-driven dlclose
+        // is therefore safe by construction (see FFI::finalize, which now closes on GC).
+        // The wrapper is created BEFORE the loop (empty; `dylib` and `functions` installed after)
+        // so its JS object can be each function's GC owner. The JS wrapper takes ownership of
+        // the box, but the allocation is stable (the wrapper holds this very pointer; finalize
+        // reclaims it), so the raw pointer captured now stays valid for the post-loop installs.
+        let lib = Box::new(FFI::default());
+        let lib_ptr: core::ptr::NonNull<FFI> = core::ptr::NonNull::from(&*lib);
+        // to_js_boxed transfers THIS box (heap::into_raw): the allocation address is
+        // preserved, so `lib_ptr` (captured above) stays valid. Plain `to_js(self)` would MOVE
+        // the FFI into a new allocation and leave `lib_ptr` dangling.
+        let js_object = FFI::to_js_boxed(lib, global);
+        let _js_object_guard = js_object.protected();
 
         for function in symbols.values_mut() {
             let function_name = ZBox::from_bytes(function.base_name.as_ref().unwrap().as_bytes());
@@ -1696,95 +1610,61 @@ impl FFI {
                         BStr::new(function_name.as_bytes()),
                         BStr::new(name)
                     ));
-                    // symbols freed by Drop
                     dylib.close();
+                    // The wrapper was pre-allocated: mark it closed so finalize drops it
+                    // rather than leaking a never-closed box (heap::release leaks by design).
+                    // SAFETY: lib_ptr points at the live, JS-owned FFI box (address preserved
+                    // by to_js_boxed).
+                    unsafe { lib_ptr.as_ref() }.do_close();
                     return ret;
                 };
 
                 function.symbol_from_dynamic_library = Some(resolved_symbol);
             }
 
-            // JavaScriptCore-native FFI: no TinyCC trampoline for this symbol at all.
-            if function.can_use_jsc_ffi() {
-                let target = function
-                    .symbol_from_dynamic_library
-                    .expect("symbol was resolved above");
-                let str = ZigString::init(function_name.as_bytes());
-                let cb = create_jsc_ffi_function(global, &str, function, target);
-                if cb.is_empty() {
-                    // The engine threw (invalid signature / executable-memory OOM); return the
-                    // ErrorInstance (take_error unwraps the JSC::Exception wrapper cell, which the
-                    // glue's Error.isError() would otherwise not recognize), matching how the
-                    // TinyCC failure paths return real errors via to_invalid_arguments().
-                    let ret = if global.has_exception() {
-                        global.take_error(JsError::Thrown)
-                    } else {
-                        global.to_invalid_arguments(format_args!(
-                            "Failed to create FFI function for symbol \"{}\" in \"{}\"",
-                            BStr::new(function_name.as_bytes()),
-                            BStr::new(name)
-                        ))
-                    };
-                    dylib.close();
-                    return ret;
-                }
-                // `cb` is rooted by the `symbolsValue` cached own-property set below.
-                obj.put(global, str.slice(), cb);
-                jsc_symbols.put(global, str.slice(), JSValue::TRUE);
-                continue;
-            }
-
-            if let Err(err) = function.compile(napi_env) {
-                let ret = global.to_invalid_arguments(format_args!(
-                    "{} when compiling symbol \"{}\" in \"{}\"",
-                    err.name(),
-                    BStr::new(function_name.as_bytes()),
-                    BStr::new(name)
-                ));
+            // The engine JSFFIFunction is the ONLY symbol implementation. The wrapper `js_object`
+            // is the owner (keeps the library alive per function); `napi_env` installs the
+            // handle-scope call hooks for symbols whose C signature involves napi types.
+            if let Some(err) = function.reject_napi_types_error(global) {
                 dylib.close();
+                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
+                unsafe { lib_ptr.as_ref() }.do_close();
+                return err;
+            }
+            let target = function
+                .symbol_from_dynamic_library
+                .expect("symbol was resolved above");
+            let str = ZigString::init(function_name.as_bytes());
+            let cb = create_jsc_ffi_function(global, &str, function, target, js_object);
+            if cb.is_empty() {
+                // The engine threw (invalid signature / executable-memory OOM / no JIT); return the
+                // ErrorInstance (take_error unwraps the JSC::Exception wrapper cell so the glue's
+                // Error.isError() recognizes it).
+                let ret = if global.has_exception() {
+                    global.take_error(JsError::Thrown)
+                } else {
+                    global.to_invalid_arguments(format_args!(
+                        "Failed to create FFI function for symbol \"{}\" in \"{}\"",
+                        BStr::new(function_name.as_bytes()),
+                        BStr::new(name)
+                    ))
+                };
+                dylib.close();
+                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
+                unsafe { lib_ptr.as_ref() }.do_close();
                 return ret;
             }
-            match &function.step {
-                Step::Failed { msg, .. } => {
-                    let res = ZigString::init(msg).to_error_instance(global);
-                    dylib.close();
-                    return res;
-                }
-                Step::Pending => {
-                    dylib.close();
-                    return ZigString::init(b"Failed to compile (nothing happend!)")
-                        .to_error_instance(global);
-                }
-                Step::Compiled(compiled) => {
-                    let str = ZigString::init(function_name.as_bytes());
-                    let cb = new_runtime_function(
-                        global,
-                        &str,
-                        u32::try_from(function.arg_types.len()).expect("int cast"),
-                        compiled.ptr.cast_const(),
-                        true,
-                        function.symbol_from_dynamic_library,
-                    );
-                    // `cb` is rooted by the `symbolsValue` cached own-property set below.
-                    obj.put(global, str.slice(), cb);
-                }
-            }
+            // `cb` is rooted by the `symbolsValue` cached own-property set below (and each
+            // function additionally roots the wrapper as its owner).
+            obj.put(global, str.slice(), cb);
         }
 
-        let lib = Box::new(FFI {
-            dylib: JsCell::new(Some(dylib)),
-            functions: JsCell::new(symbols),
-            ..Default::default()
-        });
-
-        let js_object = lib.to_js(global);
+        // Install the resolved symbols and the library handle into the pre-created wrapper.
+        // SAFETY: lib_ptr points at the live, JS-owned FFI box created above.
+        let lib_ref = unsafe { lib_ptr.as_ref() };
+        lib_ref.functions.set(symbols);
+        lib_ref.dylib.set(Some(dylib));
         symbols_value_set_cached(js_object, global, obj);
-        // Tell the JS glue which symbols are engine-native (no wrapper needed).
-        js_object.put(
-            global,
-            ZigString::static_(b"jscSymbols").slice(),
-            jsc_symbols,
-        );
         js_object
     }
 
@@ -1795,12 +1675,7 @@ impl FFI {
     }
 
     pub fn link_symbols(global: &JSGlobalObject, object_value: JSValue) -> JSValue {
-        if !bun_core::Environment::ENABLE_TINYCC {
-            let _ = global.throw(format_args!(
-                "bun:ffi linkSymbols() is not available in this build (TinyCC is disabled)"
-            ));
-            return JSValue::ZERO;
-        }
+        // Engine-native (JSC) symbols only: TinyCC is not involved in linkSymbols() any more.
         jsc::mark_binding();
 
         if object_value.is_empty_or_undefined_or_null() {
@@ -1826,10 +1701,15 @@ impl FFI {
         obj.ensure_still_alive();
         let _keep = jsc::EnsureStillAlive(obj);
 
-        let napi_env = make_napi_env_if_needed(symbols.values(), global);
-
-        // Per-symbol map (name -> true) of symbols served by the JavaScriptCore-native FFI (see open()).
-        let jsc_symbols = JSValue::create_empty_object(global, symbols.len());
+        // Wrapper created FIRST so its JS object can be each function's GC owner (see open()).
+        let lib = Box::new(FFI::default());
+        // SAFETY (see open()): the box allocation is stable after the JS wrapper adopts it.
+        let lib_ptr: core::ptr::NonNull<FFI> = core::ptr::NonNull::from(&*lib);
+        // to_js_boxed transfers THIS box (heap::into_raw): the allocation address is
+        // preserved, so `lib_ptr` (captured above) stays valid. Plain `to_js(self)` would MOVE
+        // the FFI into a new allocation and leave `lib_ptr` dangling.
+        let js_object = FFI::to_js_boxed(lib, global);
+        let _js_object_guard = js_object.protected();
 
         for function in symbols.values_mut() {
             let function_name = ZBox::from_bytes(function.base_name.as_ref().unwrap().as_bytes());
@@ -1839,78 +1719,42 @@ impl FFI {
                     "Symbol \"{}\" is missing a \"ptr\" field. When using linkSymbols() or CFunction(), you must provide a \"ptr\" field with the memory address of the native function.",
                     BStr::new(function_name.as_bytes())
                 ));
+                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
+                unsafe { lib_ptr.as_ref() }.do_close();
                 return ret;
             }
 
-            // JavaScriptCore-native FFI: no TinyCC trampoline for this symbol at all.
-            if function.can_use_jsc_ffi() {
-                let target = function.symbol_from_dynamic_library.expect("checked above");
-                let name = ZigString::init(function_name.as_bytes());
-                let cb = create_jsc_ffi_function(global, &name, function, target);
-                if cb.is_empty() {
-                    return if global.has_exception() {
-                        global.take_error(JsError::Thrown) // ErrorInstance, so Error.isError() holds
-                    } else {
-                        global.to_invalid_arguments(format_args!(
-                            "Failed to create FFI function for symbol \"{}\"",
-                            BStr::new(function_name.as_bytes())
-                        ))
-                    };
-                }
-                // `cb` is rooted by the `symbolsValue` cached own-property set below.
-                obj.put(global, name.slice(), cb);
-                jsc_symbols.put(global, name.slice(), JSValue::TRUE);
-                continue;
+            // The engine JSFFIFunction is the ONLY symbol implementation (owner = the wrapper;
+            // napi hooks when the signature involves napi types) -- see open().
+            if let Some(err) = function.reject_napi_types_error(global) {
+                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
+                unsafe { lib_ptr.as_ref() }.do_close();
+                return err;
             }
-
-            if let Err(err) = function.compile(napi_env) {
-                let ret = global.to_invalid_arguments(format_args!(
-                    "{} when compiling symbol \"{}\"",
-                    err.name(),
-                    BStr::new(function_name.as_bytes())
-                ));
-                return ret;
+            let target = function.symbol_from_dynamic_library.expect("checked above");
+            let name = ZigString::init(function_name.as_bytes());
+            let cb = create_jsc_ffi_function(global, &name, function, target, js_object);
+            if cb.is_empty() {
+                let err = if global.has_exception() {
+                    global.take_error(JsError::Thrown) // ErrorInstance, so Error.isError() holds
+                } else {
+                    global.to_invalid_arguments(format_args!(
+                        "Failed to create FFI function for symbol \"{}\"",
+                        BStr::new(function_name.as_bytes())
+                    ))
+                };
+                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
+                unsafe { lib_ptr.as_ref() }.do_close();
+                return err;
             }
-            match &function.step {
-                Step::Failed { msg, .. } => {
-                    let res = ZigString::init(msg).to_error_instance(global);
-                    return res;
-                }
-                Step::Pending => {
-                    return ZigString::static_(b"Failed to compile (nothing happend!)")
-                        .to_error_instance(global);
-                }
-                Step::Compiled(compiled) => {
-                    let name = ZigString::init(function_name.as_bytes());
-
-                    let cb = new_runtime_function(
-                        global,
-                        &name,
-                        u32::try_from(function.arg_types.len()).expect("int cast"),
-                        compiled.ptr.cast_const(),
-                        true,
-                        function.symbol_from_dynamic_library,
-                    );
-                    // `cb` is rooted by the `symbolsValue` cached own-property set below.
-                    obj.put(global, name.slice(), cb);
-                }
-            }
+            // `cb` is rooted by the `symbolsValue` cached own-property set below (and each
+            // function additionally roots the wrapper as its owner).
+            obj.put(global, name.slice(), cb);
         }
 
-        let lib = Box::new(FFI {
-            dylib: JsCell::new(None),
-            functions: JsCell::new(symbols),
-            ..Default::default()
-        });
-
-        let js_object = lib.to_js(global);
+        // SAFETY: lib_ptr points at the live, JS-owned FFI box created above.
+        unsafe { lib_ptr.as_ref() }.functions.set(symbols);
         symbols_value_set_cached(js_object, global, obj);
-        // Tell the JS glue which symbols are engine-native (no wrapper needed).
-        js_object.put(
-            global,
-            ZigString::static_(b"jscSymbols").slice(),
-            jsc_symbols,
-        );
         js_object
     }
 
@@ -1918,11 +1762,9 @@ impl FFI {
     /// straight from a `{ ptr, args?, returns? }` descriptor: no `linkSymbols()` object, no `FFI`
     /// box, no per-symbol map, nothing that has to be `close()`d (the engine cell is just GC'd).
     ///
-    /// Returns the `JSFFIFunction` on success, an Error VALUE when validation fails (the JS glue
-    /// throws it, identical to the `linkSymbols()` messages since the same validation runs), or
-    /// `undefined` when this descriptor must instead take the TinyCC-era `linkSymbols()` path
-    /// (missing `ptr`, napi_env/napi_value or cstring in the signature, threadsafe, or the engine
-    /// FFI is unavailable / disabled) so the caller falls back with unchanged behavior.
+    /// Returns the engine `JSFFIFunction` on success, or an Error VALUE when validation fails or
+    /// the descriptor has no `ptr` (the JS glue throws it). This is the single implementation:
+    /// there is no fallback path. A `cstring` return is wrapped in `CString` by the JS glue.
     pub fn create_cfunction(
         global: &JSGlobalObject,
         options: JSValue,
@@ -1930,29 +1772,31 @@ impl FFI {
     ) -> JsResult<JSValue> {
         jsc::mark_binding();
 
-        if options.is_empty_or_undefined_or_null() || !options.is_object() || !jsc_ffi_enabled() {
-            return Ok(JSValue::UNDEFINED);
+        if options.is_empty_or_undefined_or_null() || !options.is_object() {
+            return Ok(global
+                .to_invalid_arguments(format_args!("Expected an options object with a \"ptr\"")));
         }
 
         let mut function = Function::default();
         if let Some(err) = generate_symbol_for_function(global, options, &mut function)? {
             return Ok(err);
         }
-        // A cstring return still needs the JS-side `CString` wrap and napi/threadsafe signatures
-        // need the TinyCC path: hand those (and a missing ptr, for its error message) back to the
-        // fallback rather than duplicating it here.
-        if !function.can_use_jsc_ffi() || function.return_type == ABIType::CString {
-            return Ok(JSValue::UNDEFINED);
-        }
         let Some(target) = function.symbol_from_dynamic_library else {
-            return Ok(JSValue::UNDEFINED);
+            // Same wording as the linkSymbols() path (the ffi.test parity assertion).
+            return Ok(global.to_invalid_arguments(format_args!(
+                "Symbol \"CFunction\" is missing a \"ptr\" field. When using linkSymbols() or CFunction(), you must provide a \"ptr\" field with the memory address of the native function."
+            )));
         };
 
         let name = match name_value {
             Some(value) if value.is_string() => value.get_zig_string(global)?,
             _ => ZigString::static_(b"CFunction"),
         };
-        let cb = create_jsc_ffi_function(global, &name, &function, target);
+        if let Some(err) = function.reject_napi_types_error(global) {
+            return Ok(err);
+        }
+        // CFunction wraps a raw pointer the caller owns: no library owner object, no napi env.
+        let cb = create_jsc_ffi_function(global, &name, &function, target, JSValue::UNDEFINED);
         if cb.is_empty() {
             return Ok(if global.has_exception() {
                 global.take_error(JsError::Thrown) // ErrorInstance, so Error.isError() holds
@@ -2173,22 +2017,12 @@ impl Default for Function {
     }
 }
 
-unsafe extern "C" {
-    fn FFICallbackFunctionWrapper_destroy(_: *mut c_void);
-}
-
 impl Drop for Function {
     fn drop(&mut self) {
         // base_name, arg_types, Step::Failed.msg are owned and freed by drop glue.
         if let Some(state) = self.state.take() {
             // SAFETY: state is a valid TCC::State pointer; we own it
             unsafe { TCC::State::destroy(state.as_ptr()) };
-        }
-        if let Step::Compiled(compiled) = &mut self.step {
-            if let Some(wrapper) = compiled.ffi_callback_function_wrapper.take() {
-                // SAFETY: wrapper was created by Bun__createFFICallbackFunction
-                unsafe { FFICallbackFunctionWrapper_destroy(wrapper.as_ptr()) };
-            }
         }
     }
 }
@@ -2201,14 +2035,6 @@ impl Function {
             }
         }
         self.return_type == ABIType::NapiValue
-    }
-
-    /// The JavaScriptCore-native FFI path handles every signature that neither touches N-API
-    /// (napi_env/napi_value need Bun's handle-scope bracketing, still done by the TinyCC path)
-    /// nor is a threadsafe callback (foreign-thread invocation is not yet supported by the
-    /// engine-side callback trampoline), unless the global escape hatch disables it.
-    pub(crate) fn can_use_jsc_ffi(&self) -> bool {
-        jsc_ffi_enabled() && !self.needs_handle_scope() && !self.threadsafe
     }
 
     fn fail(&mut self, msg: &'static [u8]) {
@@ -2341,144 +2167,6 @@ impl Function {
         self.step = Step::Compiled(Compiled {
             ptr: symbol.as_ptr().cast::<c_void>(),
             ..Default::default()
-        });
-        Ok(())
-    }
-
-    pub(crate) fn compile_callback(
-        &mut self,
-        js_context: &JSGlobalObject,
-        js_function: JSValue,
-        is_threadsafe: bool,
-    ) -> crate::Result<()> {
-        jsc::mark_binding();
-        let mut source_code: Vec<u8> = Vec::new();
-        // SAFETY: js_context/js_function are live for the call
-        let ffi_wrapper = unsafe { Bun__createFFICallbackFunction(js_context, js_function) };
-        self.print_callback_source_code(Some(js_context), Some(ffi_wrapper), &mut source_code)?;
-
-        #[cfg(all(debug_assertions, unix))]
-        'debug_write: {
-            // SAFETY: best-effort debug write; failures are swallowed
-            unsafe {
-                let fd = libc::open(
-                    c"/tmp/bun-ffi-callback-source.c".as_ptr(),
-                    libc::O_CREAT | libc::O_WRONLY,
-                    0o644,
-                );
-                if fd < 0 {
-                    break 'debug_write;
-                }
-                let _ = libc::write(fd, source_code.as_ptr().cast::<c_void>(), source_code.len());
-                let _ = libc::ftruncate(fd, source_code.len() as libc::off_t);
-                libc::close(fd);
-            }
-        }
-
-        source_code.push(0);
-        // defer source_code.deinit();
-
-        let tcc_options: &'static ZStr = if cfg!(debug_assertions) {
-            zstr!("-std=c11 -nostdlib -Wl,--export-all-symbols -g")
-        } else {
-            zstr!("-std=c11 -nostdlib -Wl,--export-all-symbols")
-        };
-        let state = match TCC::State::init::<Function, false>(&TCC::Config {
-            options: Some(NonNull::from(tcc_options)),
-            output_type: TCC::OutputFormat::Memory,
-            err: TCC::ConfigErr {
-                ctx: Some(std::ptr::from_mut::<Function>(self)),
-                handler: Self::handle_tcc_error,
-            },
-        }) {
-            Ok(s) => s,
-            Err(TCC::Error::Alloc(bun_alloc::AllocError)) => {
-                return Err(crate::Error::TCCMissing);
-            }
-            // 1. .Memory is always a valid option, so InvalidOptions is
-            //    impossible
-            // 2. other throwable functions arent called, so their errors
-            //    aren't possible
-            Err(_) => unreachable!(),
-        };
-        self.state = Some(state);
-        let _guard = scopeguard::guard(std::ptr::from_mut::<Function>(self), |this_ptr| {
-            // SAFETY: this_ptr is &mut self for the duration of compile_callback()
-            let this = unsafe { &mut *this_ptr };
-            if matches!(this.step, Step::Failed { .. }) {
-                if let Some(s) = this.state.take() {
-                    // SAFETY: we own the state
-                    unsafe { TCC::State::destroy(s.as_ptr()) };
-                }
-            }
-        });
-        // SAFETY: just stored above
-        let state = unsafe { self.state.unwrap().as_mut() };
-
-        if self.needs_napi_env() {
-            if state
-                .add_symbol(
-                    zstr!("Bun__thisFFIModuleNapiEnv"),
-                    js_context.make_napi_env_for_ffi().cast_const(),
-                )
-                .is_err()
-            {
-                self.fail(b"Failed to add NAPI env symbol");
-                return Ok(());
-            }
-        }
-
-        CompilerRT::define(state);
-
-        // SAFETY: source_code was NUL-terminated above
-        if state
-            .compile_string(ZStr::from_slice_with_nul(&source_code[..]))
-            .is_err()
-        {
-            self.fail(b"Failed to compile source code");
-            return Ok(());
-        }
-
-        CompilerRT::inject(state);
-        let callback_sym: *const c_void = if is_threadsafe {
-            FFI_Callback_threadsafe_call as *const c_void
-        } else {
-            // TODO: stage2 - make these ptrs
-            match self.arg_types.len() {
-                0 => FFI_Callback_call_0 as *const c_void,
-                1 => FFI_Callback_call_1 as *const c_void,
-                2 => FFI_Callback_call_2 as *const c_void,
-                3 => FFI_Callback_call_3 as *const c_void,
-                4 => FFI_Callback_call_4 as *const c_void,
-                5 => FFI_Callback_call_5 as *const c_void,
-                6 => FFI_Callback_call_6 as *const c_void,
-                7 => FFI_Callback_call_7 as *const c_void,
-                _ => FFI_Callback_call as *const c_void,
-            }
-        };
-        // `callback_sym` is one of the process-lifetime `FFI_Callback_call*`
-        // extern fns.
-        if state
-            .add_symbol(zstr!("FFI_Callback_call"), callback_sym)
-            .is_err()
-        {
-            self.fail(b"Failed to add FFI callback symbol");
-            return Ok(());
-        }
-        // TinyCC now manages relocation memory internally
-        if dangerously_run_without_jit_protections(|| state.relocate()).is_err() {
-            self.fail(b"tcc_relocate returned a negative value");
-            return Ok(());
-        }
-
-        let Some(symbol) = state.get_symbol(zstr!("my_callback_function")) else {
-            self.fail(b"missing generated symbol in source code");
-            return Ok(());
-        };
-
-        self.step = Step::Compiled(Compiled {
-            ptr: symbol.as_ptr().cast::<c_void>(),
-            ffi_callback_function_wrapper: NonNull::new(ffi_wrapper),
         });
         Ok(())
     }
@@ -2635,126 +2323,16 @@ impl Function {
         Ok(())
     }
 
-    pub(crate) fn print_callback_source_code(
-        &self,
-        global_object: Option<&JSGlobalObject>,
-        context_ptr: Option<*mut c_void>,
-        writer: &mut impl std::io::Write,
-    ) -> crate::Result<()> {
-        {
-            let ptr = global_object
-                .map(|g| std::ptr::from_ref(g) as usize)
-                .unwrap_or(0);
-            let fmt = bun_fmt::hex_int_upper::<16>(ptr as u64);
-            writeln!(writer, "#define JS_GLOBAL_OBJECT (void*)0x{}ULL", fmt)?;
+    /// napi_env/napi_value are only meaningful in `cc()`-compiled source (the module napi env
+    /// is a cc() concept, injected by the TinyCC trampoline). A dlopen'd/linked/CFunction symbol
+    /// naming them is a descriptor error.
+    pub(crate) fn reject_napi_types_error(&self, global: &JSGlobalObject) -> Option<JSValue> {
+        if self.needs_napi_env() || self.return_type == ABIType::NapiValue {
+            return Some(global.to_invalid_arguments(format_args!(
+                "napi_env / napi_value are only supported in bun:ffi cc() (compiled C source), not in dlopen/linkSymbols/CFunction"
+            )));
         }
-
-        writer.write_all(b"#define IS_CALLBACK 1\n")?;
-
-        'brk: {
-            if self.return_type.is_floating_point() {
-                writer.write_all(b"#define USES_FLOAT 1\n")?;
-                break 'brk;
-            }
-
-            for arg in self.arg_types.iter() {
-                // conditionally include math.h
-                if arg.is_floating_point() {
-                    writer.write_all(b"#define USES_FLOAT 1\n")?;
-                    break;
-                }
-            }
-        }
-
-        writer.write_all(Self::ffi_header())?;
-
-        // -- Generate the FFI function symbol
-        writer.write_all(b"\n \n/* --- The Callback Function */\n")?;
-        let mut first = true;
-        self.return_type.typename(writer)?;
-
-        writer.write_all(b" my_callback_function")?;
-        writer.write_all(b"(")?;
-        for (i, arg) in self.arg_types.iter().enumerate() {
-            if !first {
-                writer.write_all(b", ")?;
-            }
-            first = false;
-            arg.typename(writer)?;
-            write!(writer, " arg{}", i)?;
-        }
-        writer.write_all(b") {\n")?;
-
-        if cfg!(debug_assertions) {
-            writer.write_all(b"#ifdef INJECT_BEFORE\n")?;
-            writer.write_all(b"INJECT_BEFORE;\n")?;
-            writer.write_all(b"#endif\n")?;
-        }
-
-        first = true;
-        let _ = first;
-
-        if !self.arg_types.is_empty() {
-            let mut arg_buf = [0u8; 512];
-            writeln!(
-                writer,
-                " ZIG_REPR_TYPE arguments[{}];",
-                self.arg_types.len()
-            )?;
-
-            arg_buf[0..3].copy_from_slice(b"arg");
-            for (i, arg) in self.arg_types.iter().enumerate() {
-                let printed = bun_core::fmt::print_int(&mut arg_buf[3..], i);
-                let arg_name = &arg_buf[0..3 + printed];
-                writeln!(
-                    writer,
-                    "arguments[{}] = {}.asZigRepr;",
-                    i,
-                    arg.to_js(arg_name)
-                )?;
-            }
-        }
-
-        writer.write_all(b"  ")?;
-        let mut inner_buf_ = [0u8; 372];
-        let inner_buf: &[u8];
-
-        {
-            let ptr = context_ptr.map(|p| p as usize).unwrap_or(0);
-            let fmt = bun_fmt::hex_int_upper::<16>(ptr as u64);
-
-            let written = if !self.arg_types.is_empty() {
-                let mut cursor = std::io::Cursor::new(&mut inner_buf_[1..]);
-                write!(
-                    &mut cursor,
-                    "FFI_Callback_call((void*)0x{}ULL, {}, arguments)",
-                    fmt,
-                    self.arg_types.len()
-                )?;
-                cursor.position() as usize
-            } else {
-                let mut cursor = std::io::Cursor::new(&mut inner_buf_[1..]);
-                write!(
-                    &mut cursor,
-                    "FFI_Callback_call((void*)0x{}ULL, 0, (ZIG_REPR_TYPE*)0)",
-                    fmt
-                )?;
-                cursor.position() as usize
-            };
-            inner_buf = &inner_buf_[1..1 + written];
-        }
-
-        if self.return_type == ABIType::Void {
-            writer.write_all(inner_buf)?;
-        } else {
-            let len = inner_buf.len() + 1;
-            let inner_buf = &mut inner_buf_[0..len];
-            inner_buf[0] = b'_';
-            write!(writer, "return {}", self.return_type.to_c_exact(inner_buf))?;
-        }
-
-        writer.write_all(b";\n}\n\n")?;
-        Ok(())
+        None
     }
 
     fn needs_napi_env(&self) -> bool {
@@ -2767,20 +2345,6 @@ impl Function {
     }
 }
 
-unsafe extern "C" {
-    fn FFI_Callback_call(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_0(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_1(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_2(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_3(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_4(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_5(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_threadsafe_call(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_6(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn FFI_Callback_call_7(_: *mut c_void, _: usize, _: *mut JSValue) -> JSValue;
-    fn Bun__createFFICallbackFunction(_: &JSGlobalObject, _: JSValue) -> *mut c_void;
-}
-
 // ─── Step ───────────────────────────────────────────────────────────────────
 
 pub enum Step {
@@ -2789,28 +2353,17 @@ pub enum Step {
     Failed { msg: Box<[u8]> },
 }
 
-/// Stores no JS function value: symbol functions are rooted by the
-/// `symbolsValue` cached own-property on the FFI wrapper, callbacks by the
-/// `JSC::Strong` inside `FFICallbackFunctionWrapper`.
+/// A cc()-compiled symbol's trampoline entry point. Symbol functions are rooted by the
+/// `symbolsValue` cached own-property on the FFI wrapper; callbacks are engine JSFFICallback
+/// cells that root themselves.
 pub struct Compiled {
     pub ptr: *mut c_void,
-    pub ffi_callback_function_wrapper: Option<NonNull<c_void>>,
 }
 
 impl Default for Compiled {
     fn default() -> Self {
         Self {
             ptr: core::ptr::null_mut(),
-            ffi_callback_function_wrapper: None,
-        }
-    }
-}
-
-impl Step {
-    fn compiled_ptr(&self) -> *mut c_void {
-        match self {
-            Step::Compiled(c) => c.ptr,
-            _ => core::ptr::null_mut(),
         }
     }
 }

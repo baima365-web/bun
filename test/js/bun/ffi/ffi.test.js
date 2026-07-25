@@ -1266,3 +1266,118 @@ describe.if(!!libPath)("can open more than 63 symbols via", () => {
     });
   }
 });
+
+// ── Regression coverage for the engine-native FFI (the single implementation behind
+// dlopen/linkSymbols/CFunction/JSCallback). Merged from the standalone file per CLAUDE.md.
+describe.skipIf(!FFI_FIXTURE_PATH)("engine-native FFI (single implementation)", () => {
+  const lib = FFI_FIXTURE_PATH;
+  it("u32 arguments >= 2^31 are not sign-flipped (#7007)", () => {
+    const {
+      symbols: { identity_uint32_t },
+    } = dlopen(lib, { identity_uint32_t: { args: ["u32"], returns: "u32" } });
+    expect(identity_uint32_t(2 ** 31)).toBe(2 ** 31);
+    expect(identity_uint32_t(2 ** 32 - 1)).toBe(2 ** 32 - 1);
+    expect(identity_uint32_t(0)).toBe(0);
+  });
+
+  it("integer parameters WRAP to width instead of clamping", () => {
+    const {
+      symbols: { identity_uint8_t },
+    } = dlopen(lib, { identity_uint8_t: { args: ["u8"], returns: "u8" } });
+    expect(identity_uint8_t(256)).toBe(0);
+    expect(identity_uint8_t(257)).toBe(1);
+    expect(identity_uint8_t(-1)).toBe(255);
+  });
+
+  it("pointers above 2^53 round-trip as exact BigInt (#28068) and BigInt addresses are accepted (#22751)", () => {
+    const {
+      symbols: { identity_ptr },
+    } = dlopen(lib, { identity_ptr: { args: ["ptr"], returns: "ptr" } });
+    const big = (1n << 60n) + 7n; // not representable as an exact double
+    const round = identity_ptr(big);
+    expect(typeof round).toBe("bigint");
+    expect(round).toBe(big);
+    // small addresses stay numbers
+    expect(identity_ptr(1024)).toBe(1024);
+    // a null pointer is null
+    expect(identity_ptr(null)).toBe(null);
+  });
+
+  it("numeric strings for numeric parameters throw (intentional behavior change)", () => {
+    const {
+      symbols: { identity_int32_t },
+    } = dlopen(lib, { identity_int32_t: { args: ["i32"], returns: "i32" } });
+    expect(() => identity_int32_t("42")).toThrow();
+    expect(identity_int32_t(42)).toBe(42);
+  });
+
+  // (JS-string -> cstring parameter conversion is covered in the engine's own stress tests;
+  //  ffi-test.c has no cstring-taking fixture, so it is not duplicated here.)
+
+  it("dlopen symbols expose intrinsic .ptr (a real address) and .native", () => {
+    const {
+      symbols: { returns_true },
+    } = dlopen(lib, { returns_true: { args: [], returns: "bool" } });
+    expect(typeof returns_true.ptr).toBe("number");
+    expect(returns_true.ptr).toBeGreaterThan(0);
+    expect(returns_true.native).toBe(returns_true);
+    expect(returns_true()).toBe(true);
+  });
+
+  it("CFunction returns the engine cell itself with a callable close()", () => {
+    const {
+      symbols: { returns_42_char },
+    } = dlopen(lib, { returns_42_char: { args: [], returns: "char" } });
+    const fn = new CFunction({ ptr: returns_42_char.ptr, args: [], returns: "char" });
+    expect(fn()).toBe(42);
+    expect(typeof fn.close).toBe("function");
+    fn.close(); // no-op on the engine path, must not throw
+    expect(fn()).toBe(42);
+  });
+
+  it("passing a JSCallback OBJECT (not .ptr) as a function-typed argument works", () => {
+    const {
+      symbols: { cb_identity_42_double },
+    } = dlopen(lib, { cb_identity_42_double: { args: ["callback"], returns: "double" } });
+    const cb = new JSCallback(() => 42.42, { returns: "double", args: [] });
+    try {
+      expect(cb_identity_42_double(cb.ptr)).toBe(42.42);
+      // the documented object form:
+      expect(cb_identity_42_double(cb)).toBe(42.42);
+    } finally {
+      cb.close();
+    }
+  });
+
+  it("a JSCallback instance is the engine cell (instanceof + own ptr) and close() is idempotent", () => {
+    const cb = new JSCallback((a) => a * 2, { args: ["i32"], returns: "i32" });
+    expect(cb instanceof JSCallback).toBe(true);
+    expect(typeof cb.ptr).toBe("number");
+    expect(cb.threadsafe).toBe(false);
+    cb.close();
+    cb.close(); // idempotent
+  });
+
+  it("an omitted callback argument throws instead of calling through NULL", () => {
+    const {
+      symbols: { cb_identity_true },
+    } = dlopen(lib, { cb_identity_true: { args: ["callback"], returns: "bool" } });
+    // undefined for a function-typed parameter must be a TypeError, not a segfault
+    expect(() => cb_identity_true(undefined)).toThrow(TypeError);
+  });
+
+  it("napi_env / napi_value are rejected outside cc()", () => {
+    expect(() => dlopen(lib, { anything: { args: ["napi_env"], returns: "napi_value", nativeName: "returns_true" } })).toThrow();
+    expect(() => new CFunction({ ptr: 1, args: ["napi_env"], returns: "void" })).toThrow();
+  });
+
+  it("a hot polymorphic call site stays correct across tiers (CallFFI)", () => {
+    const {
+      symbols: { identity_int32_t },
+    } = dlopen(lib, { identity_int32_t: { args: ["i32"], returns: "i32" } });
+    const wrappers = [() => identity_int32_t(7), () => identity_int32_t(9)];
+    let sum = 0;
+    for (let i = 0; i < 400000; ++i) sum += wrappers[i & 1]();
+    expect(sum).toBe(200000 * 7 + 200000 * 9);
+  });
+});
