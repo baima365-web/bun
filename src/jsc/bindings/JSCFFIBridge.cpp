@@ -16,7 +16,7 @@
 #include <JavaScriptCore/FFIContext.h>
 #include <JavaScriptCore/JSFFICallback.h>
 #include <JavaScriptCore/JSFFIFunction.h>
-#include "ScriptExecutionContext.h" 
+#include "ScriptExecutionContext.h"
 #include <JavaScriptCore/JSCJSValueInlines.h>
 #include <JavaScriptCore/JSCast.h>
 #include <JavaScriptCore/JSObject.h>
@@ -96,8 +96,7 @@ static void Bun__jscFFIThreadsafeDispatch(JSC::FFI::ThreadsafeInvocation& invoca
     // last deref happens on the JS thread. On a dead/terminating context nothing is queued.
     WebCore::ScriptExecutionContext::postTaskTo(contextId, [&invocation] { invocation.ref(); }, [invocation = &invocation](WebCore::ScriptExecutionContext&) mutable {
         Ref protectedInvocation = adoptRef(*invocation);
-        JSC::FFI::runThreadsafeInvocation(protectedInvocation.get());
-    });
+        JSC::FFI::runThreadsafeInvocation(protectedInvocation.get()); });
 }
 
 // JSFFICallback (threadsafe or not, per the flag), whose read-only "ptr" property is the

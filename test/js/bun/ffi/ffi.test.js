@@ -1350,7 +1350,7 @@ describe.skipIf(!FFI_FIXTURE_PATH)("engine-native FFI (single implementation)", 
   });
 
   it("a JSCallback instance is the engine cell (instanceof + own ptr) and close() is idempotent", () => {
-    const cb = new JSCallback((a) => a * 2, { args: ["i32"], returns: "i32" });
+    const cb = new JSCallback(a => a * 2, { args: ["i32"], returns: "i32" });
     expect(cb instanceof JSCallback).toBe(true);
     expect(typeof cb.ptr).toBe("number");
     expect(cb.threadsafe).toBe(false);
@@ -1367,7 +1367,9 @@ describe.skipIf(!FFI_FIXTURE_PATH)("engine-native FFI (single implementation)", 
   });
 
   it("napi_env / napi_value are rejected outside cc()", () => {
-    expect(() => dlopen(lib, { anything: { args: ["napi_env"], returns: "napi_value", nativeName: "returns_true" } })).toThrow();
+    expect(() =>
+      dlopen(lib, { anything: { args: ["napi_env"], returns: "napi_value", nativeName: "returns_true" } }),
+    ).toThrow();
     expect(() => new CFunction({ ptr: 1, args: ["napi_env"], returns: "void" })).toThrow();
   });
 
