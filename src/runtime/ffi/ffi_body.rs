@@ -1918,12 +1918,9 @@ pub(super) fn generate_symbol_for_function(
         ));
     }
 
-    if function.threadsafe && return_type != ABIType::Void {
-        return Ok(Some(
-            ZigString::static_(b"Threadsafe functions must return void").to_error_instance(global),
-        ));
-    }
-
+    // NOTE: a threadsafe callback may declare a non-void return: the invocation is queued to
+    // the JS thread and the C caller receives 0 immediately, so the return value is unspecified/
+    // ignored by design (docs/runtime/ffi.mdx). No rejection here.
     *function = Function::default();
     function.base_name = None;
     function.arg_types = abi_types;
@@ -2327,7 +2324,10 @@ impl Function {
     /// is a cc() concept, injected by the TinyCC trampoline). A dlopen'd/linked/CFunction symbol
     /// naming them is a descriptor error.
     pub(crate) fn reject_napi_types_error(&self, global: &JSGlobalObject) -> Option<JSValue> {
-        if self.needs_napi_env() || self.return_type == ABIType::NapiValue {
+        if self.needs_napi_env()
+            || self.return_type == ABIType::NapiValue
+            || self.return_type == ABIType::NapiEnv
+        {
             return Some(global.to_invalid_arguments(format_args!(
                 "napi_env / napi_value are only supported in bun:ffi cc() (compiled C source), not in dlopen/linkSymbols/CFunction/JSCallback"
             )));

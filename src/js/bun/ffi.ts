@@ -351,18 +351,16 @@ function FFIBuilder(params, returnType, functionToCall, name, coerceArgs = true)
     const tag = typeof param === "number" ? param : FFIType[param];
     const wrapper = ffiWrappers[tag];
     if (wrapper === undefined) {
-      // (unknown type -> fall to the error below)
       throw new TypeError(`Unsupported type ${params[i]}. Must be one of: ${Object.keys(FFIType).sort().join(", ")}`);
     } else if (!coerceArgs) {
       // cc(): the TinyCC trampoline performs the C-side conversion (a `(uint8_t)300` cast WRAPS
       // to 44); do NOT run the JS clamp/coercion table on top, which would change cc()'s
       // long-standing argument semantics. Pass the value through unchanged.
       args[i] = `p${i}`;
-    } else if (wrapper) {
-      // doing this inline benchmarked about 4x faster than referencing
-      args[i] = `(val=>${wrapper})(p${i})`;
     } else {
-      throw new TypeError(`Unsupported type ${params[i]}. Must be one of: ${Object.keys(FFIType).sort().join(", ")}`);
+      // Every ffiWrappers entry is a non-empty coercion expression once tag is known.
+      // Doing this inline benchmarked about 4x faster than referencing.
+      args[i] = `(val=>${wrapper})(p${i})`;
     }
   }
 
