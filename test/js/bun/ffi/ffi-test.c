@@ -106,12 +106,19 @@ uint32_t add_uint32_t(uint32_t a, uint32_t b) { return a + b; }
 uint64_t add_uint64_t(uint64_t a, uint64_t b) { return a + b; }
 
 FFI_EXPORT void *ptr_should_point_to_42_as_int32_t();
+FFI_EXPORT void *getNoopDeallocatorCallback();
 
-void *ptr_should_point_to_42_as_int32_t() {
-  int32_t *ptr = malloc(sizeof(int32_t));
-  *ptr = 42;
-  return ptr;
-}
+// Points at STATIC storage: never heap-allocated, never freed by anyone. toBuffer()/toArrayBuffer()
+// always install SOME deallocator (mimalloc's mi_free by default -- which must never receive
+// non-mimalloc memory), so views over this pointer are given the no-op deallocator below.
+static int32_t ffi_static_42 = 42;
+void *ptr_should_point_to_42_as_int32_t() { return &ffi_static_42; }
+
+// No-op deallocator for views over static data. A view carrying this callback must be collected
+// while THIS library is still loaded (the raw code address dies with the dlopen handle), which the
+// test guarantees by scoping the view and forcing a GC before it ends.
+static void noop_deallocator(void *ptr, void *ctx) { (void)ptr; (void)ctx; }
+void *getNoopDeallocatorCallback() { return &noop_deallocator; }
 
 static uint8_t buffer_with_deallocator[128];
 static int deallocatorCalled;
@@ -149,3 +156,4 @@ FFI_EXPORT uint64_t cb_identity_42_uint64_t(uint64_t (*cb)()) { return cb(); }
 FFI_EXPORT int16_t cb_identity_neg_42_int16_t(int16_t (*cb)()) { return cb(); }
 FFI_EXPORT int32_t cb_identity_neg_42_int32_t(int32_t (*cb)()) { return cb(); }
 FFI_EXPORT int64_t cb_identity_neg_42_int64_t(int64_t (*cb)()) { return cb(); }
+

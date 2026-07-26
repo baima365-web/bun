@@ -310,6 +310,10 @@ function getTypes(fast) {
       returns: "ptr",
       args: [],
     },
+    getNoopDeallocatorCallback: {
+      returns: "ptr",
+      args: [],
+    },
     getDeallocatorBuffer: {
       returns: "ptr",
       args: [],
@@ -363,6 +367,7 @@ function ffiRunner(fast) {
         is_null,
         does_pointer_equal_42_as_int32_t,
         ptr_should_point_to_42_as_int32_t,
+        getNoopDeallocatorCallback,
         cb_identity_true,
         cb_identity_false,
         cb_identity_42_char,
@@ -473,17 +478,21 @@ function ffiRunner(fast) {
       expect(cptr != 0).toBe(true);
       expect(typeof cptr === "number").toBe(true);
       expect(does_pointer_equal_42_as_int32_t(cptr)).toBe(true);
-      const buffer = toBuffer(cptr, 0, 4);
-      // Keep `buffer` strongly reachable for the rest of the suite. toBuffer() without an explicit
-      // finalizer installs mi_free as the ArrayBuffer's deallocator, so wrapping this malloc'd
-      // (non-mimalloc) pointer and letting it become garbage makes the NEXT Bun.gc(true) free a
-      // pointer mimalloc never allocated -> SIGSEGV. Pre-existing bug (not the FFI backend):
-      // https://github.com/oven-sh/bun/issues/35405, fixed properly by oven-sh/bun#31753. Remove
-      // this line once that lands.
-      (globalThis.__ffiTestKeepAlive ??= []).push(buffer);
-      expect(buffer.readInt32(0)).toBe(42);
-      expect(new DataView(toArrayBuffer(cptr, 0, 4), 0, 4).getInt32(0, true)).toBe(42);
-      expect(ptr(buffer)).toBe(cptr);
+      // `cptr` points at STATIC C data (see the fixture: never heap-allocated, never freed).
+      // toBuffer()/toArrayBuffer() ALWAYS install a deallocator -- mimalloc's mi_free by default,
+      // which must never receive non-mimalloc memory (that is oven-sh/bun#35405, previously papered
+      // over by pinning the view to process exit, which just moved the bogus mi_free to teardown).
+      // So the views get the fixture's no-op deallocator. That callback is a raw code address into
+      // this dlopen'd library, so the views are scoped and collected NOW, while it is loaded --
+      // a fixture-address finalizer must never outlive its handle.
+      const noopDeallocator = getNoopDeallocatorCallback();
+      {
+        const buffer = toBuffer(cptr, 0, 4, noopDeallocator);
+        expect(buffer.readInt32(0)).toBe(42);
+        expect(new DataView(toArrayBuffer(cptr, 0, 4, noopDeallocator), 0, 4).getInt32(0, true)).toBe(42);
+        expect(ptr(buffer)).toBe(cptr);
+      }
+      Bun.gc(true); // collect the no-op-deallocator views while the library is still loaded
       expect(new CString(cptr, 0, 1).toString()).toBe("*");
       expect(identity_ptr(cptr)).toBe(cptr);
       const second_ptr = ptr(new Buffer(8));
@@ -735,7 +744,9 @@ describe("CString", () => {
   // A bun:ffi pointer does not root the memory it points at, and `hello` is otherwise reached only
   // through `helloPtr` (a plain number). Keep the Buffer strongly reachable for the whole run so a
   // GC between tests cannot free it out from under the CString reads below.
-  (globalThis.__ffiTestKeepAlive ??= []).push(hello);
+  // (JS-allocated, mimalloc-owned Buffer: pinning it is a plain liveness guard so a GC between
+  // tests cannot free it out from under the raw `helloPtr` reads below.)
+  (globalThis.__ffiTestPinnedBuffers ??= []).push(hello);
   const helloPtr = ptr(hello);
 
   it("is string-like", () => {
