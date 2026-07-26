@@ -8,13 +8,13 @@ import {
   CFunction,
   CString,
   JSCallback,
+  linkSymbols,
   ptr,
   read,
   suffix,
   toArrayBuffer,
   toBuffer,
   viewSource,
-  linkSymbols,
 } from "bun:ffi";
 
 // Build the C fixture with the host compiler at test time (every CI test host has `cc`), so
