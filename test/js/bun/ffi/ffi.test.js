@@ -565,11 +565,10 @@ function ffiRunner(fast) {
     describe("threadsafe callback", done => {
       // 1 arg, threadsafe
       for (let [name, value] of Object.entries(typeMap)) {
-        // i64/u64: the deferred threadsafe task's BigInt argument isn't GC-rooted, so the
-        // callback can receive a reused heap cell instead of the bigint. Pre-existing on `main`
-        // (all platforms), tracked in https://github.com/oven-sh/bun/issues/35406.
-        const isBigIntType = typeof value === "bigint";
-        (isBigIntType ? it.todo : it)("fn(" + name + ") " + name, async () => {
+        // i64/u64 delivery is now correct: the engine copies the raw C argument slots on the
+        // foreign thread and converts them to BigInt on the JS thread (previously the deferred
+        // task's BigInt argument wasn't GC-rooted -- oven-sh/bun#35406, fixed by this change).
+        it("fn(" + name + ") " + name, async () => {
           const cb = new JSCallback(
             arg1 => {
               expect(arg1).toBe(value);
@@ -659,7 +658,10 @@ it("read", () => {
   delete globalThis.buffer;
 });
 
+// describe.skipIf still evaluates its callback to enumerate tests, and ffiRunner() dlopens the
+// fixture at collection time -- so guard the BODY (not just the runner) for a compiler-less host.
 describe.skipIf(!FFI_FIXTURE_PATH)("run ffi", () => {
+  if (!FFI_FIXTURE_PATH) return;
   ffiRunner(false);
   ffiRunner(true);
 });
@@ -1367,10 +1369,17 @@ describe.skipIf(!FFI_FIXTURE_PATH)("engine-native FFI (single implementation)", 
   });
 
   it("napi_env / napi_value are rejected outside cc()", () => {
-    expect(() =>
-      dlopen(lib, { anything: { args: ["napi_env"], returns: "napi_value", nativeName: "returns_true" } }),
-    ).toThrow();
-    expect(() => new CFunction({ ptr: 1, args: ["napi_env"], returns: "void" })).toThrow();
+    // `returns_true` is a real fixture symbol so the failure is the napi rejection itself, not
+    // "symbol not found".
+    expect(() => dlopen(lib, { returns_true: { args: ["napi_env"], returns: "napi_value" } })).toThrow(
+      /napi_env \/ napi_value are only supported in bun:ffi cc\(\)/,
+    );
+    expect(() => new CFunction({ ptr: 1, args: ["napi_env"], returns: "void" })).toThrow(
+      /napi_env \/ napi_value are only supported in bun:ffi cc\(\)/,
+    );
+    expect(() => new JSCallback(() => {}, { args: ["napi_env"], returns: "void" })).toThrow(
+      /napi_env \/ napi_value are only supported in bun:ffi cc\(\)/,
+    );
   });
 
   it("a hot polymorphic call site stays correct across tiers (CallFFI)", () => {

@@ -908,9 +908,8 @@ mod fields {
         super::to_array_buffer(global, value, byte_offset, length, final_ctx, final_cb)
     }
 
-    // closeCallback / closeJSCCallback → FFI::close_jsc_callback(global, JSValue) -> JSValue.
-    // There is one callback implementation now (the engine JSFFICallback cell); both field
-    // names route to the same idempotent closer.
+    // closeCallback → FFI::close_jsc_callback(global, JSValue) -> JSValue: closes the engine
+    // JSFFICallback cell (the single callback implementation). Idempotent.
     pub(super) fn close_jsc_callback(
         global: &JSGlobalObject,
         callframe: &CallFrame,

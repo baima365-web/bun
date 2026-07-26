@@ -104,9 +104,9 @@ unsafe extern "C" {
     ) -> JSValue;
 
     /// JavaScriptCore-native FFI (src/jsc/bindings/JSCFFIBridge.cpp): creates a
-    /// `JSC::JSFFIFunction` for `target` with the given ABIType tags. Returns an
-    /// empty value with an exception pending on failure. Replaces the TinyCC-JIT'd
-    /// trampoline (see `Function::compile`) for eligible signatures.
+    /// `JSC::JSFFIFunction` for `target` with the given ABIType tags -- the only
+    /// symbol implementation. Returns an empty value with an exception pending on
+    /// failure.
     fn Bun__CreateJSCFFIFunction(
         global: *const JSGlobalObject,
         symbol_name: *const ZigString,

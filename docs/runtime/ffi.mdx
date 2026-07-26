@@ -327,7 +327,7 @@ When you're done with a `JSCallback`, call `close()` to free the memory.
 
 `JSCallback` has experimental support for thread-safe callbacks. You need this if you pass a callback function into a different thread from the one that created it. Enable it with the optional `threadsafe` parameter.
 
-Thread-safe callbacks work best when run from another thread that is running JavaScript code, that is, a [`Worker`](/runtime/workers). A future version of Bun will enable them to be called from any thread, such as new threads spawned by your native library that Bun is not aware of.
+Thread-safe callbacks can be invoked from **any thread** — including threads spawned by your native library that Bun is not otherwise aware of. The engine copies the C arguments on the calling thread and marshals the invocation onto the JavaScript thread, where the arguments are converted (64-bit integers and pointers arrive as exact BigInts) and your function runs. Because the invocation is asynchronous from C's point of view, the value returned to the C caller is unspecified: treat a thread-safe callback as returning `void`.
 
 ```ts
 const searchIterator = new JSCallback((ptr, length) => /hello/.test(new CString(ptr, length)), {
