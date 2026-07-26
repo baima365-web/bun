@@ -20,8 +20,10 @@ import {
 // this suite runs on every platform instead of being skipped for lack of a prebuilt library.
 // On a compiler-less dev machine, only the fixture-dependent suite is skipped (below), not the file.
 let FFI_FIXTURE_PATH = null;
+let ABI_FIXTURE_PATH = null;
 try {
   FFI_FIXTURE_PATH = compileFixture(import.meta.dir + "/ffi-test.c");
+  ABI_FIXTURE_PATH = compileFixture(import.meta.dir + "/ffi-abi-fixture.c");
 } catch (e) {
   console.warn(`[ffi.test] fixture-dependent tests skipped: ${e?.message ?? e}`);
 }
@@ -1390,5 +1392,129 @@ describe.skipIf(!FFI_FIXTURE_PATH)("engine-native FFI (single implementation)", 
     let sum = 0;
     for (let i = 0; i < 400000; ++i) sum += wrappers[i & 1]();
     expect(sum).toBe(200000 * 7 + 200000 * 9);
+  });
+});
+
+// ── ABI conformance (external, black-box): a fixture compiled at test time whose functions
+// return POSITION-WEIGHTED combinations of their arguments, so any calling-convention error
+// (register vs stack, stack stride/packing, sign/zero-extension, positional-vs-separate int/float
+// register counting) changes the observable result. Runs on every CI platform.
+describe.skipIf(!ABI_FIXTURE_PATH)("ABI conformance", () => {
+  if (!ABI_FIXTURE_PATH) return;
+  const w = (vals, big = false) =>
+    big
+      ? vals.reduce((s, v, i) => s + BigInt(v) * BigInt(i + 1), 0n)
+      : vals.reduce((s, v, i) => s + v * (i + 1), 0);
+
+  it("integer widths and signedness at their boundaries", () => {
+    const { symbols: s } = dlopen(ABI_FIXTURE_PATH, {
+      abi_i8: { args: ["i8"], returns: "i8" }, abi_u8: { args: ["u8"], returns: "u8" },
+      abi_i16: { args: ["i16"], returns: "i16" }, abi_u16: { args: ["u16"], returns: "u16" },
+      abi_i32: { args: ["i32"], returns: "i32" }, abi_u32: { args: ["u32"], returns: "u32" },
+      abi_i64: { args: ["i64"], returns: "i64" }, abi_u64: { args: ["u64"], returns: "u64" },
+      abi_bool: { args: ["bool"], returns: "bool" }, abi_char: { args: ["char"], returns: "char" },
+    });
+    for (const v of [-128, -1, 0, 1, 127]) expect(s.abi_i8(v)).toBe(v);
+    for (const v of [0, 1, 127, 128, 255]) expect(s.abi_u8(v)).toBe(v);
+    for (const v of [-32768, -1, 0, 32767]) expect(s.abi_i16(v)).toBe(v);
+    for (const v of [0, 32767, 32768, 65535]) expect(s.abi_u16(v)).toBe(v);
+    for (const v of [-2147483648, -1, 0, 2147483647]) expect(s.abi_i32(v)).toBe(v);
+    for (const v of [0, 2147483647, 2147483648, 4294967295]) expect(s.abi_u32(v)).toBe(v); // #7007: >= 2^31 must not sign-flip
+    for (const v of [-(2n ** 63n), -1n, 0n, 2n ** 63n - 1n]) expect(s.abi_i64(v)).toBe(v);
+    for (const v of [0n, 2n ** 63n, 2n ** 64n - 1n]) expect(s.abi_u64(v)).toBe(v);
+    expect(s.abi_bool(true)).toBe(false); expect(s.abi_bool(false)).toBe(true);
+    for (const v of [0, 65, 127]) expect(s.abi_char(v)).toBe(v);
+  });
+
+  it("i32 args past the register count (stack spill, all ABIs)", () => {
+    const { symbols: { abi_sum_i32_x10 } } = dlopen(ABI_FIXTURE_PATH, { abi_sum_i32_x10: { args: Array(10).fill("i32"), returns: "i64" } });
+    const cases = [[1,2,3,4,5,6,7,8,9,10],[-1,-2,-3,-4,-5,-6,-7,-8,-9,-10],[2147483647,-2147483648,0,1,-1,7,7,7,7,7],[100000,4,5,-1,6,8,1,2,2,3]];
+    for (const a of cases) expect(abi_sum_i32_x10(...a)).toBe(w(a, true));
+  });
+
+  it("i64 args past the register count", () => {
+    const { symbols: { abi_sum_i64_x10 } } = dlopen(ABI_FIXTURE_PATH, { abi_sum_i64_x10: { args: Array(10).fill("i64"), returns: "i64" } });
+    const a = [1n, -2n, 3n, 2n ** 40n, -(2n ** 40n), 5n, 6n, -7n, 8n, 9n];
+    expect(abi_sum_i64_x10(...a)).toBe(w(a, true));
+  });
+
+  it("f64 args past the FP register count", () => {
+    const { symbols: { abi_sum_f64_x10 } } = dlopen(ABI_FIXTURE_PATH, { abi_sum_f64_x10: { args: Array(10).fill("f64"), returns: "f64" } });
+    const a = [0.5, 1.25, -2.5, 3.125, 4, -5.5, 6.75, 7, 8.5, -9.25];
+    expect(abi_sum_f64_x10(...a)).toBeCloseTo(w(a), 9);
+  });
+
+  it("f32 args past the FP register count (single-precision handling)", () => {
+    const { symbols: { abi_sum_f32_x10 } } = dlopen(ABI_FIXTURE_PATH, { abi_sum_f32_x10: { args: Array(10).fill("f32"), returns: "f64" } });
+    const a = [0.5, 1.25, -2.5, 3.125, 4, -5.5, 6.75, 7, 8.5, -9.25]; // all exactly representable as f32
+    expect(abi_sum_f32_x10(...a)).toBeCloseTo(w(a), 5);
+  });
+
+  it("mixed alternating int/float, 12 args (Win64 positional vs SysV/AAPCS64 separate)", () => {
+    const args = ["i32","f64","i32","f64","i32","f64","i32","f64","i32","f64","i32","f64"];
+    const { symbols: { abi_mix12 } } = dlopen(ABI_FIXTURE_PATH, { abi_mix12: { args, returns: "f64" } });
+    const a = [1, 0.5, -3, 1.5, 5, -2.5, 7, 3.5, -9, 4.5, 11, -5.5];
+    expect(abi_mix12(...a)).toBeCloseTo(w(a), 9);
+    const b = [2147483647, 1e-3, -2147483648, 1e6, 3, 4.25, -6, 7.75, 8, -9.5, 10, 0.125];
+    expect(abi_mix12(...b)).toBeCloseTo(w(b), 6);
+  });
+
+  it("mixed i64/f64 past the register count", () => {
+    const args = ["i64","f64","i64","f64","i64","f64","i64","f64","i64","f64"];
+    const { symbols: { abi_mix_i64f64 } } = dlopen(ABI_FIXTURE_PATH, { abi_mix_i64f64: { args, returns: "i64" } });
+    // choose f64 values whose weighted products are integral so the C-side truncation is exact
+    const a = [10n, 2, 30n, 4, 50n, 6, 70n, 8, 90n, 10];
+    const expected = a.reduce((s, v, i) => s + (typeof v === "bigint" ? v * BigInt(i + 1) : BigInt(v * (i + 1))), 0n);
+    expect(abi_mix_i64f64(...a)).toBe(expected);
+  });
+
+  it("u8 args past the register count (sub-word stack packing / Darwin natural alignment)", () => {
+    const { symbols: { abi_sum_u8_x12 } } = dlopen(ABI_FIXTURE_PATH, { abi_sum_u8_x12: { args: Array(12).fill("u8"), returns: "i64" } });
+    const a = [255, 1, 128, 0, 200, 3, 17, 254, 99, 42, 7, 250];
+    expect(abi_sum_u8_x12(...a)).toBe(w(a, true));
+  });
+
+  it("i8 args past the register count (stacked byte sign-extension)", () => {
+    const { symbols: { abi_sum_i8_x12 } } = dlopen(ABI_FIXTURE_PATH, { abi_sum_i8_x12: { args: Array(12).fill("i8"), returns: "i64" } });
+    const a = [-128, 127, -1, 0, -100, 3, 17, -2, 99, -42, 7, -50];
+    expect(abi_sum_i8_x12(...a)).toBe(w(a, true));
+  });
+
+  it("i16 args past the register count", () => {
+    const { symbols: { abi_sum_i16_x12 } } = dlopen(ABI_FIXTURE_PATH, { abi_sum_i16_x12: { args: Array(12).fill("i16"), returns: "i64" } });
+    const a = [-32768, 32767, -1, 0, -1000, 3, 1717, -2, 9999, -4242, 7, -50];
+    expect(abi_sum_i16_x12(...a)).toBe(w(a, true));
+  });
+
+  it("bool args past the register count (each exactly 0/1)", () => {
+    const { symbols: { abi_bools_x10 } } = dlopen(ABI_FIXTURE_PATH, { abi_bools_x10: { args: Array(10).fill("bool"), returns: "i32" } });
+    const bits = [true, false, true, true, false, false, true, false, true, true];
+    expect(abi_bools_x10(...bits)).toBe(bits.reduce((s, b, i) => s + (b ? 1 << i : 0), 0));
+  });
+
+  it("callback direction: C invokes JS callbacks with many-arg shapes", () => {
+    const { symbols: s } = dlopen(ABI_FIXTURE_PATH, {
+      abi_cb_i32_x10: { args: ["callback", "i32"], returns: "i64" },
+      abi_cb_f64_x10: { args: ["callback", "f64"], returns: "f64" },
+      abi_cb_mix12:   { args: ["callback", "i32", "f64"], returns: "f64" },
+      abi_cb_i64_x10: { args: ["callback", "i64"], returns: "i64" },
+    });
+    const cbI = new JSCallback((...a) => a.reduce((t, v, i) => t + BigInt(v) * BigInt(i + 1), 0n), { args: Array(10).fill("i32"), returns: "i64" });
+    const cbF = new JSCallback((...a) => a.reduce((t, v, i) => t + v * (i + 1), 0), { args: Array(10).fill("f64"), returns: "f64" });
+    const cbM = new JSCallback((...a) => a.reduce((t, v, i) => t + v * (i + 1), 0), { args: ["i32","f64","i32","f64","i32","f64","i32","f64","i32","f64","i32","f64"], returns: "f64" });
+    const cbL = new JSCallback((...a) => a.reduce((t, v, i) => t + BigInt(v) * BigInt(i + 1), 0n), { args: Array(10).fill("i64"), returns: "i64" });
+    try {
+      const ki = 5; const ai = Array.from({ length: 10 }, (_, i) => ki + i);
+      expect(s.abi_cb_i32_x10(cbI, ki)).toBe(w(ai, true));
+      const kf = 1.5; const af = Array.from({ length: 10 }, (_, i) => kf + i * 0.5);
+      expect(s.abi_cb_f64_x10(cbF, kf)).toBeCloseTo(w(af), 9);
+      const i0 = 7, d0 = 2.5;
+      const am = [i0, d0, i0+1, d0+1, i0+2, d0+2, i0+3, d0+3, i0+4, d0+4, i0+5, d0+5];
+      expect(s.abi_cb_mix12(cbM, i0, d0)).toBeCloseTo(w(am), 9);
+      const kl = 2n ** 40n; const al = Array.from({ length: 10 }, (_, i) => kl + BigInt(i));
+      expect(s.abi_cb_i64_x10(cbL, kl)).toBe(w(al, true));
+    } finally {
+      cbI.close(); cbF.close(); cbM.close(); cbL.close();
+    }
   });
 });
