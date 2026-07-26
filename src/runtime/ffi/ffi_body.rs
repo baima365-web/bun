@@ -1333,6 +1333,12 @@ impl FFI {
             return Ok(val);
         }
 
+        // napi_env / napi_value are cc()-only; JSCallback rejects them like dlopen/linkSymbols/
+        // CFunction do (same class of check at every engine entry point).
+        if let Some(err) = func.reject_napi_types_error(global_this) {
+            return Ok(err);
+        }
+
         // TODO: WeakRefHandle that automatically frees it?
         func.base_name = Some(ZBox::from_bytes(b""));
         js_callback.ensure_still_alive();
@@ -1580,20 +1586,19 @@ impl FFI {
         let obj = JSValue::create_empty_object(global, size);
         let _obj_guard = obj.protected();
 
-        // The FFI wrapper is created FIRST (its function map filled in after the loop) so its JS
-        // object can be the GC OWNER of every function: the engine keeps the wrapper -- and thus
-        // the loaded library -- alive while any of its functions is reachable. GC-driven dlclose
-        // is therefore safe by construction (the wrapper stays alive while any function cell does; teardown is still owned by close(), see FFI::finalize).
-        // The wrapper is created BEFORE the loop (empty; `dylib` and `functions` installed after)
-        // so its JS object can be each function's GC owner. The JS wrapper takes ownership of
-        // the box, but the allocation is stable (the wrapper holds this very pointer; finalize
-        // reclaims it), so the raw pointer captured now stays valid for the post-loop installs.
-        let lib = Box::new(FFI::default());
-        let lib_ptr: core::ptr::NonNull<FFI> = core::ptr::NonNull::from(&*lib);
-        // to_js_boxed transfers THIS box (heap::into_raw): the allocation address is
-        // preserved, so `lib_ptr` (captured above) stays valid. Plain `to_js(self)` would MOVE
-        // the FFI into a new allocation and leave `lib_ptr` dangling.
-        let js_object = FFI::to_js_boxed(lib, global);
+        // The FFI wrapper is created BEFORE the loop (its `dylib` and `functions` are installed
+        // after) so its JS object can be each function's GC OWNER: the engine keeps the wrapper
+        // alive while any function CELL referencing it is reachable, so the wrapper is never
+        // finalized under a live function. Teardown is still owned by close() -- this is NOT a
+        // license for GC-driven dlclose, because raw `.ptr` addresses can escape the GC's view
+        // (see FFI::finalize). Take the raw pointer FROM the allocation (into_raw) and hand THAT
+        // pointer to JS: one pointer, derived after the box's final move, with write provenance
+        // -- never a frozen `NonNull::from(&*lib)` reborrow.
+        let lib_ptr: *mut FFI = bun_core::heap::into_raw(Box::new(FFI::default()));
+        // Ownership of `lib_ptr` transfers to the JS wrapper (reclaimed by FFIClass__finalize);
+        // this Rust code keeps using the same pointer for the post-loop installs and error paths.
+        // SAFETY: `lib_ptr` is the fresh allocation from into_raw above.
+        let js_object = unsafe { FFI::to_js_ptr(lib_ptr, global) };
         let _js_object_guard = js_object.protected();
 
         for function in symbols.values_mut() {
@@ -1611,22 +1616,20 @@ impl FFI {
                     dylib.close();
                     // The wrapper was pre-allocated: mark it closed so finalize drops it
                     // rather than leaking a never-closed box (heap::release leaks by design).
-                    // SAFETY: lib_ptr points at the live, JS-owned FFI box (address preserved
-                    // by to_js_boxed).
-                    unsafe { lib_ptr.as_ref() }.do_close();
+                    // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+                    unsafe { &*lib_ptr }.do_close();
                     return ret;
                 };
 
                 function.symbol_from_dynamic_library = Some(resolved_symbol);
             }
 
-            // The engine JSFFIFunction is the ONLY symbol implementation. The wrapper `js_object`
-            // is the owner (keeps the library alive per function); `napi_env` installs the
-            // handle-scope call hooks for symbols whose C signature involves napi types.
+            // The engine JSFFIFunction is the ONLY symbol implementation; the wrapper
+            // `js_object` is each function's GC owner (napi types were rejected just above).
             if let Some(err) = function.reject_napi_types_error(global) {
                 dylib.close();
-                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
-                unsafe { lib_ptr.as_ref() }.do_close();
+                // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+                unsafe { &*lib_ptr }.do_close();
                 return err;
             }
             let target = function
@@ -1648,8 +1651,8 @@ impl FFI {
                     ))
                 };
                 dylib.close();
-                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
-                unsafe { lib_ptr.as_ref() }.do_close();
+                // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+                unsafe { &*lib_ptr }.do_close();
                 return ret;
             }
             // `cb` is rooted by the `symbolsValue` cached own-property set below (and each
@@ -1658,8 +1661,8 @@ impl FFI {
         }
 
         // Install the resolved symbols and the library handle into the pre-created wrapper.
-        // SAFETY: lib_ptr points at the live, JS-owned FFI box created above.
-        let lib_ref = unsafe { lib_ptr.as_ref() };
+        // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+        let lib_ref = unsafe { &*lib_ptr };
         lib_ref.functions.set(symbols);
         lib_ref.dylib.set(Some(dylib));
         symbols_value_set_cached(js_object, global, obj);
@@ -1699,14 +1702,13 @@ impl FFI {
         obj.ensure_still_alive();
         let _keep = jsc::EnsureStillAlive(obj);
 
-        // Wrapper created FIRST so its JS object can be each function's GC owner (see open()).
-        let lib = Box::new(FFI::default());
-        // SAFETY (see open()): the box allocation is stable after the JS wrapper adopts it.
-        let lib_ptr: core::ptr::NonNull<FFI> = core::ptr::NonNull::from(&*lib);
-        // to_js_boxed transfers THIS box (heap::into_raw): the allocation address is
-        // preserved, so `lib_ptr` (captured above) stays valid. Plain `to_js(self)` would MOVE
-        // the FFI into a new allocation and leave `lib_ptr` dangling.
-        let js_object = FFI::to_js_boxed(lib, global);
+        // Wrapper created FIRST so its JS object can be each function's GC owner (see open()):
+        // one raw pointer from into_raw, handed to JS, reused for the post-loop installs.
+        let lib_ptr: *mut FFI = bun_core::heap::into_raw(Box::new(FFI::default()));
+        // Ownership of `lib_ptr` transfers to the JS wrapper (reclaimed by FFIClass__finalize);
+        // this Rust code keeps using the same pointer for the post-loop installs and error paths.
+        // SAFETY: `lib_ptr` is the fresh allocation from into_raw above.
+        let js_object = unsafe { FFI::to_js_ptr(lib_ptr, global) };
         let _js_object_guard = js_object.protected();
 
         for function in symbols.values_mut() {
@@ -1717,16 +1719,16 @@ impl FFI {
                     "Symbol \"{}\" is missing a \"ptr\" field. When using linkSymbols() or CFunction(), you must provide a \"ptr\" field with the memory address of the native function.",
                     BStr::new(function_name.as_bytes())
                 ));
-                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
-                unsafe { lib_ptr.as_ref() }.do_close();
+                // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+                unsafe { &*lib_ptr }.do_close();
                 return ret;
             }
 
-            // The engine JSFFIFunction is the ONLY symbol implementation (owner = the wrapper;
-            // napi hooks when the signature involves napi types) -- see open().
+            // The engine JSFFIFunction is the ONLY symbol implementation (owner = the wrapper)
+            // -- see open().
             if let Some(err) = function.reject_napi_types_error(global) {
-                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
-                unsafe { lib_ptr.as_ref() }.do_close();
+                // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+                unsafe { &*lib_ptr }.do_close();
                 return err;
             }
             let target = function.symbol_from_dynamic_library.expect("checked above");
@@ -1741,8 +1743,8 @@ impl FFI {
                         BStr::new(function_name.as_bytes())
                     ))
                 };
-                // SAFETY: lib_ptr points at the live, JS-owned FFI box (to_js_boxed).
-                unsafe { lib_ptr.as_ref() }.do_close();
+                // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+                unsafe { &*lib_ptr }.do_close();
                 return err;
             }
             // `cb` is rooted by the `symbolsValue` cached own-property set below (and each
@@ -1750,8 +1752,8 @@ impl FFI {
             obj.put(global, name.slice(), cb);
         }
 
-        // SAFETY: lib_ptr points at the live, JS-owned FFI box created above.
-        unsafe { lib_ptr.as_ref() }.functions.set(symbols);
+        // SAFETY: lib_ptr is the live, JS-owned FFI allocation (from into_raw).
+        unsafe { &*lib_ptr }.functions.set(symbols);
         symbols_value_set_cached(js_object, global, obj);
         js_object
     }
@@ -2327,7 +2329,7 @@ impl Function {
     pub(crate) fn reject_napi_types_error(&self, global: &JSGlobalObject) -> Option<JSValue> {
         if self.needs_napi_env() || self.return_type == ABIType::NapiValue {
             return Some(global.to_invalid_arguments(format_args!(
-                "napi_env / napi_value are only supported in bun:ffi cc() (compiled C source), not in dlopen/linkSymbols/CFunction"
+                "napi_env / napi_value are only supported in bun:ffi cc() (compiled C source), not in dlopen/linkSymbols/CFunction/JSCallback"
             )));
         }
         None

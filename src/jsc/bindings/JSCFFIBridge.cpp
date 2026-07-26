@@ -77,7 +77,6 @@ extern "C" JSC::EncodedJSValue Bun__CreateJSCFFIFunction(
     RELEASE_AND_RETURN(scope, JSC::JSValue::encode(function));
 }
 
-// Creates a JSC-native (non-threadsafe) FFI callback wrapping `callable`. Returns the encoded
 // ---- threadsafe callback dispatch ----
 // The engine calls this (possibly from a FOREIGN thread) when a threadsafe JSFFICallback is
 // entered natively. It carries only refcounted C data: the raw copied argument slots plus the
@@ -99,8 +98,8 @@ static void Bun__jscFFIThreadsafeDispatch(JSC::FFI::ThreadsafeInvocation& invoca
         JSC::FFI::runThreadsafeInvocation(protectedInvocation.get()); });
 }
 
-// JSFFICallback (threadsafe or not, per the flag), whose read-only "ptr" property is the
-// native entry point handed to C code.
+// Creates a JSC::JSFFICallback wrapping `callable` (threadsafe or not, per the flag) and
+// returns it encoded; its read-only "ptr" property is the native entry point handed to C code.
 extern "C" JSC::EncodedJSValue Bun__CreateJSCFFICallback(
     Zig::GlobalObject* globalObject,
     JSC::EncodedJSValue callableValue,

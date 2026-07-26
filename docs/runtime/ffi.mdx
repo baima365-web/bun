@@ -49,7 +49,7 @@ According to [our benchmark](https://github.com/oven-sh/bun/tree/main/bench/ffi)
 
 <Image src="/images/ffi.png" height="400" />
 
-Bun generates and just-in-time compiles C bindings that efficiently convert values between JavaScript types and native types. To compile C, Bun embeds [TinyCC](https://github.com/TinyCC/tinycc), a small and fast C compiler.
+`dlopen`, `linkSymbols`, `CFunction`, and `JSCallback` are implemented natively by Bun's JavaScript engine (JavaScriptCore): argument conversion, arity handling, and result boxing happen in-engine, and hot call sites compile down through the DFG/FTL JIT tiers into direct native calls with no per-argument JavaScript shim. [TinyCC](https://github.com/TinyCC/tinycc), a small and fast C compiler, is embedded only for [`cc()`](/runtime/c-compiler), which compiles C source you provide at runtime.
 
 ---
 
@@ -224,7 +224,11 @@ my_library_free(myString.ptr);
 console.log(myString);
 ```
 
-When used in `returns`, `FFIType.cstring` coerces the pointer to a JavaScript `string`. When used in `args`, `FFIType.cstring` is identical to `ptr`.
+When used in `returns`, `FFIType.cstring` coerces the pointer to a JavaScript `string`. When used in `args`, `FFIType.cstring` accepts everything `ptr` does **and** additionally accepts a JavaScript string directly — the engine transcodes it to a null-terminated UTF-8 buffer that lives for the duration of the call, so you don't need to encode it into a `Buffer` yourself:
+
+```ts
+symbols.puts("Hello, world!"); // args: ["cstring"] — pass the string directly
+```
 
 ---
 
