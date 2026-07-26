@@ -108,9 +108,6 @@ bun_core::comptime_string_map! {
 struct AbiRow {
     /// C type name for return/decl position (`typename_label`).
     c_type: &'static [u8],
-    /// `(T)` cast prefix emitted by `ToCFormatter` when `exact` is set. Empty
-    /// when no cast is wanted (Buffer) or the row is unreachable (Void/Napi*).
-    to_c_cast: &'static str,
     /// `JSVALUE_TO_*( ` macro head. `None` for the three early-return arms
     /// (Void / NapiEnv / NapiValue) handled inline by `ToCFormatter`.
     to_c_macro: Option<&'static str>,
@@ -123,34 +120,33 @@ struct AbiRow {
 static ABI_TABLE: [AbiRow; 21] = {
     const fn r(
         c_type: &'static [u8],
-        to_c_cast: &'static str,
         to_c_macro: Option<&'static str>,
         to_js: Option<(&'static str, &'static str)>,
     ) -> AbiRow {
-        AbiRow { c_type, to_c_cast, to_c_macro, to_js }
+        AbiRow { c_type, to_c_macro, to_js }
     }
     [
-    /* Char      */ r(b"char",       "(char)",     Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
-    /* Int8T     */ r(b"int8_t",     "(int8_t)",   Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
-    /* Uint8T    */ r(b"uint8_t",    "(uint8_t)",  Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
-    /* Int16T    */ r(b"int16_t",    "(int16_t)",  Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
-    /* Uint16T   */ r(b"uint16_t",   "(uint16_t)", Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
-    /* Int32T    */ r(b"int32_t",    "(int32_t)",  Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
-    /* Uint32T   */ r(b"uint32_t",   "(uint32_t)", Some("JSVALUE_TO_INT32("),               Some(("UINT32_TO_JSVALUE(", ")"))),
-    /* Int64T    */ r(b"int64_t",    "(int64_t)",  Some("JSVALUE_TO_INT64("),               Some(("INT64_TO_JSVALUE_SLOW(JS_GLOBAL_OBJECT, ", ")"))),
-    /* Uint64T   */ r(b"uint64_t",   "(uint64_t)", Some("JSVALUE_TO_UINT64("),              Some(("UINT64_TO_JSVALUE_SLOW(JS_GLOBAL_OBJECT, ", ")"))),
-    /* Double    */ r(b"double",     "(double)",   Some("JSVALUE_TO_DOUBLE("),              Some(("DOUBLE_TO_JSVALUE(", ")"))),
-    /* Float     */ r(b"float",      "(float)",    Some("JSVALUE_TO_FLOAT("),               Some(("FLOAT_TO_JSVALUE(", ")"))),
-    /* Bool      */ r(b"bool",       "(bool)",     Some("JSVALUE_TO_BOOL("),                Some(("BOOLEAN_TO_JSVALUE(", ")"))),
-    /* Ptr       */ r(b"void*",      "(void*)",    Some("JSVALUE_TO_PTR("),                 Some(("PTR_TO_JSVALUE(", ")"))),
-    /* Void      */ r(b"void",       "",           None,                                    None),
-    /* CString   */ r(b"void*",      "(void*)",    Some("JSVALUE_TO_PTR("),                 Some(("PTR_TO_JSVALUE(", ")"))),
-    /* I64Fast   */ r(b"int64_t",    "(int64_t)",  Some("JSVALUE_TO_INT64("),               Some(("INT64_TO_JSVALUE(JS_GLOBAL_OBJECT, (int64_t)", ")"))),
-    /* U64Fast   */ r(b"uint64_t",   "(uint64_t)", Some("JSVALUE_TO_UINT64("),              Some(("UINT64_TO_JSVALUE(JS_GLOBAL_OBJECT, ", ")"))),
-    /* Function  */ r(b"void*",      "(void*)",    Some("JSVALUE_TO_PTR("),                 Some(("PTR_TO_JSVALUE(", ")"))),
-    /* NapiEnv   */ r(b"napi_env",   "",           None,                                    None),
-    /* NapiValue */ r(b"napi_value", "",           None,                                    Some(("((EncodedJSValue) {.asNapiValue = ", " } )"))),
-    /* Buffer    */ r(b"void*",      "",           Some("JSVALUE_TO_TYPED_ARRAY_VECTOR("),  None),
+    /* Char      */ r(b"char",       Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
+    /* Int8T     */ r(b"int8_t",     Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
+    /* Uint8T    */ r(b"uint8_t",    Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
+    /* Int16T    */ r(b"int16_t",    Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
+    /* Uint16T   */ r(b"uint16_t",   Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
+    /* Int32T    */ r(b"int32_t",    Some("JSVALUE_TO_INT32("),               Some(("INT32_TO_JSVALUE((int32_t)", ")"))),
+    /* Uint32T   */ r(b"uint32_t",   Some("JSVALUE_TO_INT32("),               Some(("UINT32_TO_JSVALUE(", ")"))),
+    /* Int64T    */ r(b"int64_t",    Some("JSVALUE_TO_INT64("),               Some(("INT64_TO_JSVALUE_SLOW(JS_GLOBAL_OBJECT, ", ")"))),
+    /* Uint64T   */ r(b"uint64_t",   Some("JSVALUE_TO_UINT64("),              Some(("UINT64_TO_JSVALUE_SLOW(JS_GLOBAL_OBJECT, ", ")"))),
+    /* Double    */ r(b"double",     Some("JSVALUE_TO_DOUBLE("),              Some(("DOUBLE_TO_JSVALUE(", ")"))),
+    /* Float     */ r(b"float",      Some("JSVALUE_TO_FLOAT("),               Some(("FLOAT_TO_JSVALUE(", ")"))),
+    /* Bool      */ r(b"bool",       Some("JSVALUE_TO_BOOL("),                Some(("BOOLEAN_TO_JSVALUE(", ")"))),
+    /* Ptr       */ r(b"void*",      Some("JSVALUE_TO_PTR("),                 Some(("PTR_TO_JSVALUE(", ")"))),
+    /* Void      */ r(b"void",       None,                                    None),
+    /* CString   */ r(b"void*",      Some("JSVALUE_TO_PTR("),                 Some(("PTR_TO_JSVALUE(", ")"))),
+    /* I64Fast   */ r(b"int64_t",    Some("JSVALUE_TO_INT64("),               Some(("INT64_TO_JSVALUE(JS_GLOBAL_OBJECT, (int64_t)", ")"))),
+    /* U64Fast   */ r(b"uint64_t",   Some("JSVALUE_TO_UINT64("),              Some(("UINT64_TO_JSVALUE(JS_GLOBAL_OBJECT, ", ")"))),
+    /* Function  */ r(b"void*",      Some("JSVALUE_TO_PTR("),                 Some(("PTR_TO_JSVALUE(", ")"))),
+    /* NapiEnv   */ r(b"napi_env",   None,                                    None),
+    /* NapiValue */ r(b"napi_value", None,                                    Some(("((EncodedJSValue) {.asNapiValue = ", " } )"))),
+    /* Buffer    */ r(b"void*",      Some("JSVALUE_TO_TYPED_ARRAY_VECTOR("),  None),
     ]
 };
 
@@ -217,19 +213,7 @@ impl ABIType {
     }
 
     pub fn to_c(self, symbol: &[u8]) -> ToCFormatter<'_> {
-        ToCFormatter {
-            tag: self,
-            symbol,
-            exact: false,
-        }
-    }
-
-    pub fn to_c_exact(self, symbol: &[u8]) -> ToCFormatter<'_> {
-        ToCFormatter {
-            tag: self,
-            symbol,
-            exact: true,
-        }
+        ToCFormatter { tag: self, symbol }
     }
 
     pub fn to_js(self, symbol: &[u8]) -> ToJSFormatter<'_> {
@@ -254,7 +238,6 @@ impl ABIType {
 pub struct ToCFormatter<'a> {
     pub symbol: &'a [u8],
     pub tag: ABIType,
-    pub exact: bool,
 }
 
 impl fmt::Display for ToCFormatter<'_> {
@@ -268,9 +251,6 @@ impl fmt::Display for ToCFormatter<'_> {
                 _ => unreachable!(),
             };
         };
-        if self.exact && !row.to_c_cast.is_empty() {
-            writer.write_str(row.to_c_cast)?;
-        }
         writer.write_str(macro_)?;
         fmt::Display::fmt(BStr::new(self.symbol), writer)?;
         writer.write_str(")")

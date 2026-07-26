@@ -1905,7 +1905,7 @@ pub(super) fn generate_symbol_for_function(
 
     if return_type == ABIType::NapiEnv {
         return Ok(Some(
-            ZigString::static_(b"Cannot return napi_env to JavaScript").to_error_instance(global),
+            ZigString::static_(b"Cannot return napi_env to JavaScript: a napi_env is an in-parameter for cc()-compiled C, never a return value").to_error_instance(global),
         ));
     }
 
@@ -2324,10 +2324,10 @@ impl Function {
     /// is a cc() concept, injected by the TinyCC trampoline). A dlopen'd/linked/CFunction symbol
     /// naming them is a descriptor error.
     pub(crate) fn reject_napi_types_error(&self, global: &JSGlobalObject) -> Option<JSValue> {
-        if self.needs_napi_env()
-            || self.return_type == ABIType::NapiValue
-            || self.return_type == ABIType::NapiEnv
-        {
+        // (returns: "napi_env" never reaches here: generate_symbol_for_function -- shared by
+        // every entry point including cc() -- rejects it up front, since a napi_env can never
+        // be handed back to JavaScript regardless of path.)
+        if self.needs_napi_env() || self.return_type == ABIType::NapiValue {
             return Some(global.to_invalid_arguments(format_args!(
                 "napi_env / napi_value are only supported in bun:ffi cc() (compiled C source), not in dlopen/linkSymbols/CFunction/JSCallback"
             )));

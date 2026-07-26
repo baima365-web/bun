@@ -1,7 +1,7 @@
 import { spawnSync } from "bun";
 import { cc } from "bun:ffi";
 import { beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, statSync } from "fs";
+import { existsSync } from "fs";
 import { bunEnv, bunExe, canBuildNodeAddons, isASAN, isWindows } from "harness";
 import { join } from "path";
 
@@ -30,19 +30,12 @@ let cc1, cc2;
 
 const nodeApiHeadersInclude = join(__dirname, "napi-app/node_modules/node-api-headers/include");
 
-// The addons here don't link against bun, so existing binaries stay valid across
-// bun builds. `bun install` triggers a full `node-gyp rebuild` (clean + build of
-// every target in napi-app), so skip it when the two .node files this test needs
-// already exist and are newer than their sources (napi.test.ts or a previous run
-// usually has built them already).
+// This file no longer loads any prebuilt .node binaries (napi types are cc()-only under the
+// engine-native FFI); cc() compiles ffi_addon_1.c from source itself. The only prerequisite is
+// the node-api headers for cc()'s `-I` flag, so skip the (expensive, all-targets) `bun install`
+// / node-gyp rebuild whenever those headers are already present.
 function needsInstall(): boolean {
-  if (!existsSync(nodeApiHeadersInclude)) return true;
-  for (const name of ["ffi_addon_1", "ffi_addon_2"]) {
-    const built = join(__dirname, `napi-app/build/Debug/${name}.node`);
-    if (!existsSync(built)) return true;
-    if (statSync(built).mtimeMs < statSync(join(__dirname, `napi-app/${name}.c`)).mtimeMs) return true;
-  }
-  return false;
+  return !existsSync(nodeApiHeadersInclude);
 }
 
 beforeAll(() => {

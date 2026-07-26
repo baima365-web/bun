@@ -357,9 +357,9 @@ declare module "bun:ffi" {
     [FFIType.double]: number;
     [FFIType.float]: number;
     [FFIType.bool]: boolean;
-    [FFIType.ptr]: NodeJS.TypedArray | Pointer | CString | null;
+    [FFIType.ptr]: NodeJS.TypedArray | Pointer | bigint | CString | null;
     [FFIType.void]: undefined;
-    [FFIType.cstring]: NodeJS.TypedArray | Pointer | CString | null;
+    [FFIType.cstring]: string | NodeJS.TypedArray | Pointer | CString | null;
     [FFIType.i64_fast]: number | bigint;
     [FFIType.u64_fast]: number | bigint;
     [FFIType.function]: Pointer | JSCallback; // cannot be null
@@ -380,7 +380,7 @@ declare module "bun:ffi" {
     [FFIType.double]: number;
     [FFIType.float]: number;
     [FFIType.bool]: boolean;
-    [FFIType.ptr]: Pointer | null;
+    [FFIType.ptr]: Pointer | bigint | null;
     [FFIType.void]: undefined;
     [FFIType.cstring]: CString;
     [FFIType.i64_fast]: number | bigint;

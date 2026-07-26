@@ -139,12 +139,6 @@ const ffiWrappers = new Array(21);
 
 var char = "val|0";
 ffiWrappers.fill(char);
-// napi types are pass-through: `napi_value` IS the raw JS value (no numeric coercion), and a
-// `napi_env` argument is injected by the cc() trampoline (the JS-side placeholder is ignored).
-// Without explicit entries these indices inherited the char/int32 `val|0` coercion, which
-// mangled objects/strings into 0. (napi types are only valid in cc().)
-ffiWrappers[FFIType.napi_env] = "val";
-ffiWrappers[FFIType.napi_value] = "val";
 ffiWrappers[FFIType.uint8_t] = "val<0?0:val>=255?255:val|0";
 ffiWrappers[FFIType.int16_t] = "val<=-32768?-32768:val>=32768?32768:val|0";
 ffiWrappers[FFIType.uint16_t] = "val<=0?0:val>=65536?65536:val|0";
@@ -340,7 +334,7 @@ function wrapSymbol(symbol, returnType, name) {
 // Accept both string names ("i32") and numeric tags (FFIType.i32): resolve the numeric tag once,
 // since ffiWrappers is indexed by tag and the cc()-only types (napi_env=18, napi_value=19) and
 // buffer=20 have no reverse-mapping string key in FFIType.
-function FFIBuilder(params, returnType, functionToCall, name, coerceArgs = true) {
+function FFIBuilder(params, returnType, functionToCall, name) {
   const returnTag = typeof returnType === "number" ? returnType : FFIType[returnType];
   const hasReturnType = typeof returnTag === "number" && returnTag !== FFIType.void;
   var paramNames = new Array(params.length);
@@ -352,16 +346,12 @@ function FFIBuilder(params, returnType, functionToCall, name, coerceArgs = true)
     const wrapper = ffiWrappers[tag];
     if (wrapper === undefined) {
       throw new TypeError(`Unsupported type ${params[i]}. Must be one of: ${Object.keys(FFIType).sort().join(", ")}`);
-    } else if (!coerceArgs) {
-      // cc(): the TinyCC trampoline performs the C-side conversion (a `(uint8_t)300` cast WRAPS
-      // to 44); do NOT run the JS clamp/coercion table on top, which would change cc()'s
-      // long-standing argument semantics. Pass the value through unchanged.
-      args[i] = `p${i}`;
-    } else {
-      // Every ffiWrappers entry is a non-empty coercion expression once tag is known.
-      // Doing this inline benchmarked about 4x faster than referencing.
-      args[i] = `(val=>${wrapper})(p${i})`;
     }
+    // cc() is FFIBuilder's only caller and its arguments reach the TinyCC-compiled trampoline
+    // UNCHANGED: the C-side casts do the conversion (a `(uint8_t)300` cast WRAPS to 44), so no
+    // JS clamp/coercion runs here. The wrapper table above is consulted only to validate the
+    // type tag; the pointer rows also feed the ptr() helpers.
+    args[i] = `p${i}`;
   }
 
   var code = `functionToCall(${args.join(", ")})`;
@@ -519,9 +509,6 @@ function cc(options) {
         // we want
         //    "sqlite3_get_version() - sqlit3.so"
         path.includes("/") ? `${key} (${path.split("/").pop()})` : `${key} (${path})`,
-        // cc() arguments are converted by the TinyCC trampoline (C casts wrap), not by the JS
-        // clamp/coercion table -- preserve cc()'s existing argument semantics.
-        false,
       );
     } else {
       // consistentcy

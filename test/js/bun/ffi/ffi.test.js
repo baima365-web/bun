@@ -14,6 +14,7 @@ import {
   toArrayBuffer,
   toBuffer,
   viewSource,
+  linkSymbols,
 } from "bun:ffi";
 
 // Build the C fixture with the host compiler at test time (every CI test host has `cc`), so
@@ -1286,6 +1287,32 @@ describe.if(!!libPath)("can open more than 63 symbols via", () => {
 // dlopen/linkSymbols/CFunction/JSCallback). Merged from the standalone file per CLAUDE.md.
 describe.skipIf(!FFI_FIXTURE_PATH)("engine-native FFI (single implementation)", () => {
   const lib = FFI_FIXTURE_PATH;
+  // linkSymbols() is one of the four engine-native entry points (dlopen / linkSymbols / CFunction
+  // / JSCallback all route to the same JSFFIFunction machinery). CFunction() used to reach
+  // FFI::link_symbols transitively; that indirection is gone, so cover its happy path directly:
+  // take the raw addresses of dlopen'd symbols and re-bind them through linkSymbols.
+  it("linkSymbols() binds and calls symbols from raw pointers", () => {
+    const {
+      symbols: { returns_true, add_int32_t, identity_ptr },
+    } = dlopen(lib, {
+      returns_true: { args: [], returns: "bool" },
+      add_int32_t: { args: ["i32", "i32"], returns: "i32" },
+      identity_ptr: { args: ["ptr"], returns: "ptr" },
+    });
+    const linked = linkSymbols({
+      isTrue: { ptr: returns_true.ptr, args: [], returns: "bool" },
+      sum: { ptr: add_int32_t.ptr, args: ["i32", "i32"], returns: "i32" },
+      echoPtr: { ptr: identity_ptr.ptr, args: ["ptr"], returns: "ptr" },
+    });
+    expect(linked.symbols.isTrue()).toBe(true);
+    expect(linked.symbols.sum(40, 2)).toBe(42);
+    expect(linked.symbols.sum(-1, -2)).toBe(-3);
+    expect(linked.symbols.echoPtr(1234)).toBe(1234);
+    // The bound functions carry the same intrinsic surface as dlopen'd ones.
+    expect(typeof linked.symbols.sum.ptr).toBe("number");
+    linked.close();
+  });
+
   it("u32 arguments >= 2^31 are not sign-flipped (#7007)", () => {
     const {
       symbols: { identity_uint32_t },
