@@ -7,6 +7,7 @@
 
 #include "ZigGlobalObject.h"
 #include "BunClientData.h"
+#include <JavaScriptCore/StringConstructor.h>
 #include <JavaScriptCore/JSArrayBuffer.h>
 #include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/JSString.h>
@@ -282,9 +283,13 @@ void setupJSFFICStringClassStructure(LazyClassStructure::Initializer& init)
     auto* prototype = JSFFICStringPrototype::create(init.vm, init.global, prototypeStructure);
 
     // ... and the constructor's own [[Prototype]] is the String constructor (static inheritance),
-    // so `Object.getPrototypeOf(CString) === String` and inherited statics keep resolving.
-    JSValue stringConstructor = init.global->stringPrototype()->getDirect(init.vm, init.vm.propertyNames->constructor);
-    JSValue constructorPrototype = stringConstructor.isObject() ? stringConstructor : JSValue(init.global->functionPrototype());
+    // so `Object.getPrototypeOf(CString) === String` and inherited statics keep resolving. Reach
+    // it through the realm's barrier'd constructor, NOT `String.prototype.constructor`: that
+    // property is user-writable/configurable, so a `delete` before this lazy init would yield an
+    // empty JSValue here (and `JSValue().isObject()` derefs a null cell on JSVALUE64), and a
+    // replacement would silently change CString's static prototype. The realm accessor is neither
+    // nullable after init nor user-mutable.
+    JSObject* constructorPrototype = init.global->stringConstructor();
     auto* constructorStructure = JSFFICStringConstructor::createStructure(init.vm, init.global, constructorPrototype);
     auto* constructor = JSFFICStringConstructor::create(init.vm, init.global, constructorStructure, prototype);
 
