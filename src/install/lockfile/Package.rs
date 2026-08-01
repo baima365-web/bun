@@ -2602,11 +2602,7 @@ impl Package<u64> {
 
         for group in &dependency_groups {
             if group.behavior.is_workspace() {
-                let mut seen_workspace_names: ArrayHashMap<
-                    TruncatedPackageNameHash,
-                    (),
-                    ArrayIdentityContext,
-                > = ArrayHashMap::default();
+                let mut seen_workspace_names = StringSet::init();
                 // defer seen_workspace_names.deinit(allocator); — Drop handles it
                 for (entry, path_) in workspace_names
                     .values()
@@ -2614,10 +2610,8 @@ impl Package<u64> {
                     .zip(workspace_names.keys().iter())
                 {
                     // workspace names from their package jsons. duplicates not allowed
-                    let gop = seen_workspace_names
-                        .get_or_put(semver::string::Builder::string_hash(&entry.name)
-                            as TruncatedPackageNameHash)?;
-                    if gop.found_existing {
+                    // GH#36386: use StringSet for real string comparison, not u32 hash truncation
+                    if seen_workspace_names.contains(&entry.name) {
                         // this path does alot of extra work to format the error message
                         // but this is ok because the install is going to fail anyways, so this
                         // has zero effect on the happy path.
@@ -2712,6 +2706,8 @@ impl Package<u64> {
                         );
                         return Err(crate::Error::InstallFailed);
                     }
+
+                    let _ = seen_workspace_names.insert(&entry.name);
 
                     let external_name = string_builder.append::<ExternalString>(&entry.name);
 

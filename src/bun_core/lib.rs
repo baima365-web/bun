@@ -1724,9 +1724,64 @@ pub(crate) mod strings_impl {
     /// Port of `elementLengthUTF16IntoUTF8`: the exact UTF-8 byte length of a
     /// UTF-16 (LE) input, charging 3 bytes (U+FFFD) per unpaired surrogate,
     /// which is exactly what `copy_utf16_into_utf8` / `to_utf8_alloc` write.
+    ///
+    /// NOTE: The simdutf `le_with_replacement` FFI has a known bug where it counts
+    /// lone surrogates as 2 bytes instead of 3. This implementation corrects that
+    /// by counting surrogates explicitly and using the fast path for well-formed
+    /// UTF-16 (no surrogates). See bun issue #35606.
     #[inline]
     pub fn element_length_utf16_into_utf8(utf16: &[u16]) -> usize {
-        simdutf::length::utf8::from::utf16::le_with_replacement(utf16)
+        if utf16.is_empty() {
+            return 0;
+        }
+        // Fast path: check if there are any surrogates first.
+        // If no surrogates, use the SIMD-optimized path directly.
+        let has_surrogates = utf16.iter().any(|&c| u16_is_lead(c) || u16_is_trail(c));
+        if !has_surrogates {
+            return simdutf::length::utf8::from::utf16::le(utf16);
+        }
+        // Slow path: count surrogates and compute byte length manually.
+        // Well-formed surrogate pairs → 4 bytes (supplementary code point)
+        // Lone surrogates → 3 bytes (U+FFFD replacement)
+        // BMP chars → 1-3 bytes depending on code point value
+        let mut i = 0;
+        let mut total = 0usize;
+        while i < utf16.len() {
+            let c = utf16[i];
+            if u16_is_lead(c) {
+                if let Some(&trail) = utf16.get(i + 1) {
+                    if u16_is_trail(trail) {
+                        // Valid surrogate pair → supplementary code point (4 UTF-8 bytes)
+                        let cp = u16_get_supplementary(c, trail);
+                        total += if cp <= 0x10FFFF {
+                            4
+                        } else {
+                            3 // Invalid supplementary, treat as U+FFFD
+                        };
+                        i += 2;
+                        continue;
+                    }
+                }
+                // Lone high surrogate → U+FFFD (3 bytes)
+                total += 3;
+                i += 1;
+            } else if u16_is_trail(c) {
+                // Lone low surrogate → U+FFFD (3 bytes)
+                total += 3;
+                i += 1;
+            } else {
+                // Regular BMP character
+                if c <= 0x7F {
+                    total += 1;
+                } else if c <= 0x7FF {
+                    total += 2;
+                } else {
+                    total += 3;
+                }
+                i += 1;
+            }
+        }
+        total
     }
 
     /// Port of `elementLengthLatin1IntoUTF8`.
@@ -2926,3 +2981,61 @@ pub fn return_address() -> usize {
         0
     }
 }
+
+    // ── Regression test for bun #35606: Buffer.byteLength surrogate undercount ──
+    #[cfg(test)]
+    mod byte_length_tests {
+        use super::*;
+
+        #[test]
+        fn test_lone_surrogate_byte_length() {
+            // "hello \uD83D" — 6 ASCII + 1 lone high surrogate
+            // Expected: 6*1 + 3(U+FFFD) = 9 bytes
+            let input: &[u16] = &[0x0068, 0x0065, 0x006C, 0x006C, 0x006F, 0x0020, 0xD83D];
+            let result = element_length_utf16_into_utf8(input);
+            assert_eq!(result, 9, "lone surrogate should count as 3 bytes (U+FFFD), got {}", result);
+        }
+
+        #[test]
+        fn test_valid_surrogate_pair() {
+            // "😀" — U+1F600 = D83D DE00 (valid pair → supplementary → 4 UTF-8 bytes)
+            let input: &[u16] = &[0xD83D, 0xDE00];
+            let result = element_length_utf16_into_utf8(input);
+            assert_eq!(result, 4, "valid surrogate pair should be 4 bytes, got {}", result);
+        }
+
+        #[test]
+        fn test_mixed_string() {
+            // "hello 😀 world" — no surrogates, all well-formed
+            let input: &[u16] = &[
+                0x0068, 0x0065, 0x006C, 0x006C, 0x006F, 0x0020,
+                0xD83D, 0xDE00,
+                0x0020, 0x0077, 0x006F, 0x0072, 0x006C, 0x0064,
+            ];
+            let result = element_length_utf16_into_utf8(input);
+            assert_eq!(result, 15, "mixed string: 6+4+5=15 bytes, got {}", result);
+        }
+
+        #[test]
+        fn test_lone_low_surrogate() {
+            // Lone low surrogate U+DFFF → 3 bytes (U+FFFD)
+            let input: &[u16] = &[0xDFFF];
+            let result = element_length_utf16_into_utf8(input);
+            assert_eq!(result, 3, "lone low surrogate should be 3 bytes, got {}", result);
+        }
+
+        #[test]
+        fn test_empty_string() {
+            let input: &[u16] = &[];
+            let result = element_length_utf16_into_utf8(input);
+            assert_eq!(result, 0, "empty string should be 0 bytes");
+        }
+
+        #[test]
+        fn test_multiple_lone_surrogates() {
+            // 5 lone surrogates → 5 * 3 = 15 bytes
+            let input: &[u16] = &[0xD800, 0xD801, 0xD802, 0xD803, 0xD804];
+            let result = element_length_utf16_into_utf8(input);
+            assert_eq!(result, 15, "5 lone surrogates = 15 bytes, got {}", result);
+        }
+    }
