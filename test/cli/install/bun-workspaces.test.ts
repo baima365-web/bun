@@ -1211,6 +1211,39 @@ test.concurrent("it should detect duplicate workspace dependencies", async () =>
   expect(await exited).toBe(1);
 });
 
+// GH#36386: different package names with same u32 hash should NOT be flagged as duplicates
+test.concurrent("it should not flag different workspace names as duplicates due to hash collision", async () => {
+  using ctx = await setupTest();
+  const { packageDir, packageJson, env } = ctx;
+  await write(
+    packageJson,
+    JSON.stringify({
+      name: "foo",
+      workspaces: ["packages/*"],
+    }),
+  );
+
+  // Use two different package names that should NOT be flagged as duplicates
+  await mkdir(join(packageDir, "packages", "pkg-a"), { recursive: true });
+  await write(join(packageDir, "packages", "pkg-a", "package.json"), JSON.stringify({ name: "pkg-a" }));
+  await mkdir(join(packageDir, "packages", "pkg-b"), { recursive: true });
+  await write(join(packageDir, "packages", "pkg-b", "package.json"), JSON.stringify({ name: "pkg-b" }));
+
+  var { stderr, exited } = spawn({
+    cmd: [bunExe(), "install"],
+    cwd: packageDir,
+    stdout: "pipe",
+    stdin: "pipe",
+    stderr: "pipe",
+    env,
+  });
+
+  var err = await stderr.text();
+  expect(err).not.toContain('Workspace name "pkg-a" already exists');
+  expect(err).not.toContain('Workspace name "pkg-b" already exists');
+  expect(await exited).toBe(0);
+});
+
 const versions = ["workspace:1.0.0", "workspace:*", "workspace:^1.0.0", "1.0.0", "*"];
 
 for (const rootVersion of versions) {
